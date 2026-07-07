@@ -17,6 +17,13 @@ app.use((req, res, next) => {
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
+app.get('/', (req, res) => res.send('OK'));
+
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') return res.status(200).json({ ok: true });
+  next(err);
+});
+
 async function initDB() {
   const client = await pool.connect();
   try {
