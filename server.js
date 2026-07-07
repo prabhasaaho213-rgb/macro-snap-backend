@@ -24,34 +24,43 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-async function initDB() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        phone TEXT PRIMARY KEY,
-        subscribed BOOLEAN DEFAULT false,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS meals (
-        id TEXT PRIMARY KEY,
-        phone TEXT REFERENCES users(phone),
-        date TIMESTAMPTZ NOT NULL,
-        name TEXT NOT NULL,
-        category TEXT DEFAULT '',
-        calories INTEGER NOT NULL,
-        protein DOUBLE PRECISION NOT NULL,
-        carbs DOUBLE PRECISION NOT NULL,
-        fats DOUBLE PRECISION NOT NULL,
-        fiber DOUBLE PRECISION NOT NULL,
-        serving TEXT DEFAULT '',
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-    console.log('Database tables ready');
-  } finally {
-    client.release();
+async function initDB(retries = 5) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const client = await pool.connect();
+      try {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS users (
+            phone TEXT PRIMARY KEY,
+            subscribed BOOLEAN DEFAULT false,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS meals (
+            id TEXT PRIMARY KEY,
+            phone TEXT REFERENCES users(phone),
+            date TIMESTAMPTZ NOT NULL,
+            name TEXT NOT NULL,
+            category TEXT DEFAULT '',
+            calories INTEGER NOT NULL,
+            protein DOUBLE PRECISION NOT NULL,
+            carbs DOUBLE PRECISION NOT NULL,
+            fats DOUBLE PRECISION NOT NULL,
+            fiber DOUBLE PRECISION NOT NULL,
+            serving TEXT DEFAULT '',
+            created_at TIMESTAMPTZ DEFAULT NOW()
+          );
+        `);
+        console.log('Database tables ready');
+        return;
+      } finally {
+        client.release();
+      }
+    } catch (e) {
+      console.log(`DB init attempt ${i + 1}/${retries} failed: ${e.message}`);
+      if (i < retries - 1) await new Promise(r => setTimeout(r, 3000));
+    }
   }
+  console.log('DB init failed after all retries, running without database');
 }
 initDB();
 
