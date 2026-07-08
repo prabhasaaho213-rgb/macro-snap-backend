@@ -3,8 +3,6 @@ const express = require('express');
 const multer = require('multer');
 const sharp = require('sharp');
 const { Pool } = require('pg');
-const Razorpay = require('razorpay');
-const crypto = require('crypto');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -64,45 +62,10 @@ async function initDB(retries = 5) {
 }
 initDB();
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
-
 async function prepareImage(buffer, mimetype) {
   if (mimetype === 'image/jpeg') return buffer;
   return sharp(buffer).jpeg().toBuffer();
 }
-
-app.get('/razorpay-key', (req, res) => {
-  res.json({ keyId: process.env.RAZORPAY_KEY_ID });
-});
-
-app.post('/create-order', async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const order = await razorpay.orders.create({
-      amount: amount * 100,
-      currency: 'INR',
-      receipt: 'sub_' + Date.now(),
-      notes: { product: 'MacroSnap Pro Subscription' }
-    });
-    res.json(order);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/verify-payment', (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-  const body = razorpay_order_id + '|' + razorpay_payment_id;
-  const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(body).digest('hex');
-  if (expected === razorpay_signature) {
-    res.json({ status: 'ok', subscribed: true });
-  } else {
-    res.status(400).json({ status: 'failed', subscribed: false });
-  }
-});
 
 app.post('/analyze', upload.single('image'), async (req, res) => {
   try {
