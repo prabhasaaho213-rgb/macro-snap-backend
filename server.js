@@ -30,6 +30,8 @@ async function initDB(retries = 5) {
         await client.query(`
           CREATE TABLE IF NOT EXISTS users (
             phone TEXT PRIMARY KEY,
+            email TEXT,
+            name TEXT DEFAULT '',
             subscribed BOOLEAN DEFAULT false,
             created_at TIMESTAMPTZ DEFAULT NOW()
           );
@@ -48,6 +50,8 @@ async function initDB(retries = 5) {
             created_at TIMESTAMPTZ DEFAULT NOW()
           );
         `);
+        try { await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT'); } catch (_) {}
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''"); } catch (_) {}
         console.log('Database tables ready');
         return;
       } finally {
@@ -128,10 +132,18 @@ Use Indian food composition data. Return ONLY raw JSON. No markdown. No backtick
 
 app.post('/register', async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone required' });
-    await pool.query('INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING', [phone]);
-    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+    const { phone, email, name } = req.body;
+    if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
+    const identifier = phone || email;
+    if (email && name) {
+      await pool.query(
+        'INSERT INTO users (phone, email, name) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET email = $2, name = $3',
+        [identifier, email, name]
+      );
+    } else {
+      await pool.query('INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING', [identifier]);
+    }
+    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [identifier]);
     res.json({ phone: user.rows[0].phone, subscribed: user.rows[0].subscribed });
   } catch (e) {
     res.status(500).json({ error: e.message });
