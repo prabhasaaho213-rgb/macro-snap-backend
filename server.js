@@ -130,6 +130,59 @@ Use Indian food composition data. Return ONLY raw JSON. No markdown. No backtick
   }
 });
 
+app.post('/generate-diet-plan', async (req, res) => {
+  try {
+    const { weight, height, age, gender, goal, activity } = req.body;
+    if (!weight || !height || !age) return res.status(400).json({ error: 'Weight, height & age required' });
+
+    const bmr = gender === 'male' ? 10 * weight + 6.25 * height - 5 * age + 5 : 10 * weight + 6.25 * height - 5 * age - 161;
+    const multipliers = { sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, veryActive: 1.9 };
+    const tdee = bmr * (multipliers[activity] || 1.2);
+    const bmi = weight / ((height / 100) * (height / 100));
+    const calTarget = goal === 'loseWeight' ? tdee - 500 : goal === 'gainMuscle' ? tdee + 300 : tdee;
+    const proteinTarget = goal === 'gainMuscle' ? weight * 2.2 : goal === 'loseWeight' ? weight * 2.0 : weight * 1.6;
+    const fatTarget = calTarget * 0.25 / 9;
+    const carbTarget = (calTarget - (proteinTarget * 4) - (fatTarget * 9)) / 4;
+
+    const prompt = `You are an Indian nutritionist. Generate a personalized ONE-DAY Indian diet plan.
+User: ${gender}, ${age} yrs, ${weight}kg, ${height}cm, BMI ${bmi.toFixed(1)}.
+Goal: ${goal}, Activity: ${activity}.
+TDEE: ${tdee.round()} kcal, Target: ${calTarget.round()} kcal/day.
+Macros: Protein ${proteinTarget.toFixed(0)}g, Carbs ${carbTarget.toFixed(0)}g, Fats ${fatTarget.toFixed(0)}g.
+
+Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
+{
+  "meals": [
+    { "name": "Meal name", "time": "7:00 AM", "description": "detailed food items with Indian portions",
+      "calories": number, "protein_g": number, "carbs_g": number, "fats_g": number },
+    ... 4-5 meals total (breakfast, snack, lunch, snack, dinner)
+  ],
+  "water": "recommended water intake",
+  "tips": ["tip1", "tip2", "tip3"]
+}`;
+
+    const key = process.env.GEMINI_KEY;
+    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (!text) throw new Error('Empty response from AI');
+
+    const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
+    const plan = JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
+
+    res.json({ bmi: bmi.toFixed(1), bmr: bmr.round(), tdee: tdee.round(), targetCalories: calTarget.round(), targetProtein: proteinTarget.toFixed(0), targetCarbs: carbTarget.toFixed(0), targetFats: fatTarget.toFixed(0), plan });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/register', async (req, res) => {
   try {
     const { phone, email, name } = req.body;
