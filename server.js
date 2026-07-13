@@ -54,6 +54,9 @@ async function initDB(retries = 5) {
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_count INTEGER DEFAULT 0"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_month INTEGER DEFAULT 0"); } catch (_) {}
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT"); } catch (_) {}
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by TEXT"); } catch (_) {}
+        try { await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_code ON users (referral_code)"); } catch (_) {}
         await client.query(`
           CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
@@ -117,20 +120,25 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
     const body = JSON.stringify({
       contents: [{
         parts: [
-          { text: `You are a professional Indian nutritionist. Analyze this food photo and return ONLY valid JSON with these fields:
+          { text: `You are a professional Indian nutritionist. The photo likely contains one or more food items (e.g. a full thali). Identify EVERY visible dish and return ONLY valid JSON:
 {
-  "meal_name": "short meal name in English",
-  "calories_per_100g": calories per 100g as integer,
-  "protein_g_per_100g": protein in grams per 100g as number,
-  "carbs_g_per_100g": carbohydrates in grams per 100g as number,
-  "fats_g_per_100g": fat in grams per 100g as number,
-  "fiber_g_per_100g": fiber in grams per 100g as number,
-  "sugar_g_per_100g": sugar in grams per 100g as number,
-  "suitable_for": "bulk" if high protein/calories, "diet" if low calorie/low fat, "both" if balanced,
-  "confidence": estimated accuracy between 0 and 1,
-  "description": "brief description of what was detected"
+  "description": "brief summary of what was detected",
+  "confidence": estimated accuracy 0-1,
+  "dishes": [
+    {
+      "name": "dish name in English",
+      "portion_description": "estimated portion like '1 small katori' or '2 rotis'",
+      "calories_per_100g": integer,
+      "protein_g_per_100g": number,
+      "carbs_g_per_100g": number,
+      "fats_g_per_100g": number,
+      "fiber_g_per_100g": number,
+      "sugar_g_per_100g": number,
+      "suitable_for": "bulk"/"diet"/"both"
+    }
+  ]
 }
-Use Indian food composition data. Return ONLY raw JSON. No markdown. No backticks.` },
+Rules: 1 dish entry per visible item (rice, dal, sabzi, roti, salad, curd, pickle). Be specific about portions. Use Indian food data. Return ONLY raw JSON. No markdown. No backticks.` },
           { inlineData: { mimeType: 'image/jpeg', data: base64 } }
         ]
       }]
@@ -163,17 +171,35 @@ Use Indian food composition data. Return ONLY raw JSON. No markdown. No backtick
     const updated = phone ? await pool.query('SELECT scan_count FROM users WHERE phone = $1', [phone]) : null;
     const scansUsed = updated?.rows[0]?.scan_count || 0;
 
+    let dishes = json.dishes;
+    if (!dishes || !Array.isArray(dishes) || dishes.length === 0) {
+      dishes = [{
+        name: json.meal_name || 'Unknown',
+        portion_description: json.portion_description || '',
+        calories_per_100g: json.calories_per_100g ?? json.calories ?? 0,
+        protein_g_per_100g: json.protein_g_per_100g ?? json.protein_g ?? 0,
+        carbs_g_per_100g: json.carbs_g_per_100g ?? json.carbs_g ?? 0,
+        fats_g_per_100g: json.fats_g_per_100g ?? json.fats_g ?? 0,
+        fiber_g_per_100g: json.fiber_g_per_100g ?? json.fiber_g ?? 0,
+        sugar_g_per_100g: json.sugar_g_per_100g ?? 0,
+        suitable_for: json.suitable_for || 'both'
+      }];
+    }
+
     const normalized = {
-      meal_name: json.meal_name || 'Unknown',
-      calories_per_100g: json.calories_per_100g ?? json.calories ?? 0,
-      protein_g_per_100g: json.protein_g_per_100g ?? json.protein_g ?? 0,
-      carbs_g_per_100g: json.carbs_g_per_100g ?? json.carbs_g ?? 0,
-      fats_g_per_100g: json.fats_g_per_100g ?? json.fats_g ?? 0,
-      fiber_g_per_100g: json.fiber_g_per_100g ?? json.fiber_g ?? 0,
-      sugar_g_per_100g: json.sugar_g_per_100g ?? 0,
-      suitable_for: json.suitable_for || 'both',
-      confidence: json.confidence ?? 0.7,
       description: json.description || '',
+      confidence: json.confidence ?? 0.7,
+      dishes: dishes.map(d => ({
+        name: d.name || 'Unknown',
+        portion_description: d.portion_description || '',
+        calories_per_100g: d.calories_per_100g ?? d.calories ?? 0,
+        protein_g_per_100g: d.protein_g_per_100g ?? d.protein_g ?? 0,
+        carbs_g_per_100g: d.carbs_g_per_100g ?? d.carbs_g ?? 0,
+        fats_g_per_100g: d.fats_g_per_100g ?? d.fats_g ?? 0,
+        fiber_g_per_100g: d.fiber_g_per_100g ?? d.fiber_g ?? 0,
+        sugar_g_per_100g: d.sugar_g_per_100g ?? 0,
+        suitable_for: d.suitable_for || 'both'
+      })),
       scans_used: scansUsed,
       scans_limit: SCAN_LIMIT_FREE
     };
@@ -251,6 +277,71 @@ app.post('/register', async (req, res) => {
     }
     const user = await pool.query('SELECT * FROM users WHERE phone = $1', [identifier]);
     res.json({ phone: user.rows[0].phone, subscribed: user.rows[0].subscribed });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function generateReferralCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+app.post('/referral/generate', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    const existing = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+    if (existing.rows[0]?.referral_code) {
+      return res.json({ referral_code: existing.rows[0].referral_code });
+    }
+    let code;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      code = generateReferralCode();
+      const dup = await pool.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+      if (dup.rows.length === 0) break;
+    }
+    await pool.query('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
+    res.json({ referral_code: code });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/referral/my-code/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    let result = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+    if (!result.rows[0]?.referral_code) {
+      let code;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        code = generateReferralCode();
+        const dup = await pool.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+        if (dup.rows.length === 0) break;
+      }
+      await pool.query('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
+      result = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+    }
+    res.json({ referral_code: result.rows[0].referral_code });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/referral/apply', async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    if (!phone || !code) return res.status(400).json({ error: 'Phone and code required' });
+    const referrer = await pool.query('SELECT phone, subscribed FROM users WHERE referral_code = $1', [code.toUpperCase()]);
+    if (referrer.rows.length === 0) return res.status(404).json({ error: 'Invalid referral code' });
+    if (referrer.rows[0].phone === phone) return res.status(400).json({ error: 'Cannot use your own code' });
+    const newUser = await pool.query('SELECT referred_by FROM users WHERE phone = $1', [phone]);
+    if (newUser.rows[0]?.referred_by) return res.status(400).json({ error: 'Already used a referral code' });
+    await pool.query('UPDATE users SET referred_by = $1, subscribed = true WHERE phone = $2', [code.toUpperCase(), phone]);
+    await pool.query('UPDATE users SET subscribed = true WHERE phone = $1', [referrer.rows[0].phone]);
+    res.json({ subscribed: true, referrer: referrer.rows[0].phone });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
