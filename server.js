@@ -52,12 +52,14 @@ async function initDB(retries = 5) {
         `);
         try { await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT'); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''"); } catch (_) {}
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_count INTEGER DEFAULT 0"); } catch (_) {}
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_month INTEGER DEFAULT 0"); } catch (_) {}
         await client.query(`
           CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
             phone TEXT NOT NULL,
             transaction_ref TEXT NOT NULL,
-            amount INTEGER DEFAULT 49,
+            amount INTEGER DEFAULT 29,
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW()
           );
@@ -81,9 +83,32 @@ async function prepareImage(buffer, mimetype) {
   return sharp(buffer).jpeg().toBuffer();
 }
 
+const SCAN_LIMIT_FREE = 3;
+
 app.post('/analyze', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+
+    const phone = req.body?.phone || '';
+    if (phone) {
+      const now = new Date();
+      const currentMonth = now.getFullYear() * 12 + now.getMonth();
+      const user = await pool.query('SELECT subscribed, scan_count, scan_month FROM users WHERE phone = $1', [phone]);
+      if (user.rows.length > 0) {
+        const { subscribed, scan_count, scan_month } = user.rows[0];
+        if (!subscribed) {
+          if (scan_month !== currentMonth) {
+            await pool.query('UPDATE users SET scan_count = 0, scan_month = $1 WHERE phone = $2', [currentMonth, phone]);
+          }
+          const count = scan_month === currentMonth ? (scan_count || 0) : 0;
+          if (count >= SCAN_LIMIT_FREE) {
+            return res.status(403).json({ error: 'scan_limit_reached', scans_used: count, scans_limit: SCAN_LIMIT_FREE });
+          }
+        }
+      } else {
+        await pool.query('INSERT INTO users (phone, scan_count, scan_month) VALUES ($1, 0, $2) ON CONFLICT (phone) DO NOTHING', [phone, currentMonth]);
+      }
+    }
 
     const key = process.env.GEMINI_KEY;
     const jpegBuffer = await prepareImage(req.file.buffer, req.file.mimetype);
@@ -126,6 +151,18 @@ Use Indian food composition data. Return ONLY raw JSON. No markdown. No backtick
     const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
     const json = JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
 
+    if (phone) {
+      await pool.query(
+        'UPDATE users SET scan_count = COALESCE(scan_count, 0) + 1 WHERE phone = $1',
+        [phone]
+      );
+    }
+
+    const now = new Date();
+    const currentMonth = now.getFullYear() * 12 + now.getMonth();
+    const updated = phone ? await pool.query('SELECT scan_count FROM users WHERE phone = $1', [phone]) : null;
+    const scansUsed = updated?.rows[0]?.scan_count || 0;
+
     const normalized = {
       meal_name: json.meal_name || 'Unknown',
       calories_per_100g: json.calories_per_100g ?? json.calories ?? 0,
@@ -136,7 +173,9 @@ Use Indian food composition data. Return ONLY raw JSON. No markdown. No backtick
       sugar_g_per_100g: json.sugar_g_per_100g ?? 0,
       suitable_for: json.suitable_for || 'both',
       confidence: json.confidence ?? 0.7,
-      description: json.description || ''
+      description: json.description || '',
+      scans_used: scansUsed,
+      scans_limit: SCAN_LIMIT_FREE
     };
     res.json(normalized);
   } catch (e) {
