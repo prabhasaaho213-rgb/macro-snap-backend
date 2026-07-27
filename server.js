@@ -4,6 +4,9 @@ const multer = require('multer');
 const sharp = require('sharp');
 const { Pool } = require('pg');
 
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
+
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -14,6 +17,12 @@ app.use((req, res, next) => {
 });
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+// Initialize Razorpay
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 app.get('/', (req, res) => res.send('OK'));
 
@@ -397,6 +406,85 @@ app.post('/unsubscribe', async (req, res) => {
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     await pool.query('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
     res.json({ subscribed: false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Razorpay: Create Order ────────────────────────────────────────────────
+app.post('/payment/create-order', async (req, res) => {
+  try {
+    const { phone, amount, currency } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    if (!process.env.RAZORPAY_KEY_ID) {
+      return res.status(500).json({ error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env' });
+    }
+
+    const options = {
+      amount: amount || 2900, // ₹29 in paise by default
+      currency: currency || 'INR',
+      receipt: `macrosnap_${phone}_${Date.now()}`,
+      notes: { phone },
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    res.json({
+      order_id: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      razorpay_key: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Razorpay: Verify Payment ──────────────────────────────────────────────
+app.post('/payment/verify', async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Verify signature using HMAC SHA256
+    const body = `${razorpay_order_id}|${razorpay_payment_id}`;
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(body)
+      .digest('hex');
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+
+    // Fetch the payment to get the phone from order notes
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
+    const phone = payment.notes?.phone;
+    if (!phone) {
+      console.error('Could not determine phone from payment notes', { payment_id: razorpay_payment_id });
+      return res.status(400).json({ error: 'Could not identify user for this payment' });
+    }
+
+    // Store payment in database
+    try {
+      await pool.query(
+        `INSERT INTO payments (phone, transaction_ref, amount, status)
+         VALUES ($1, $2, $3, 'approved')`,
+        [phone, razorpay_payment_id, (payment.amount || 2900) / 100]
+      );
+    } catch (e) {
+      console.error('Payment insert failed:', e.message);
+    }
+
+    // Activate subscription
+    await pool.query(
+      'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true',
+      [phone]
+    );
+
+    res.json({ success: true, subscribed: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
