@@ -573,6 +573,28 @@ ${payments.rows.map(p => `<tr>
   }
 });
 
+// --- Subscription verification (source of truth: Postgres) ---------------
+app.get('/subscription/status', async (req, res) => {
+  try {
+    const { phone, email } = req.query;
+    if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
+    // Prefer the phone match (phone is the PK), then fall back to email so a
+    // matching email can never resolve to a different user's row.
+    let user = null;
+    if (phone) {
+      const r = await pool.query('SELECT subscribed FROM users WHERE phone = $1 LIMIT 1', [phone]);
+      user = r.rows[0] || null;
+    }
+    if (!user && email) {
+      const r = await pool.query('SELECT subscribed FROM users WHERE email = $1 LIMIT 1', [email]);
+      user = r.rows[0] || null;
+    }
+    res.json({ subscribed: user?.subscribed || false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/admin/approve/:id', async (req, res) => {
   try {
     const { id } = req.params;
