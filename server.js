@@ -10,7 +10,10 @@ const crypto = require('crypto');
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-app.use(express.json());
+// Capture the raw request body for every request so the Razorpay payment
+// webhook can verify its HMAC signature against the exact bytes sent
+// (express.json alone would only give us the parsed object).
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   next();
@@ -25,6 +28,42 @@ const razorpay = new Razorpay({
 });
 
 app.get('/', (req, res) => res.send('OK'));
+
+// ─── Razorpay Subscription plan (created once, cached in memory) ───────
+// Real recurring billing needs a monthly plan. We reuse an existing matching
+// plan if present (idempotent across redeploys) and create one otherwise.
+let cachedPlanId = null;
+async function getPlanId() {
+  if (cachedPlanId) return cachedPlanId;
+  try {
+    const plans = await razorpay.plans.all({ count: 100 });
+    const match = (plans.items || []).find(
+      (p) =>
+        p.item &&
+        p.item.amount === 2900 &&
+        p.item.name === 'MacroSnap Pro' &&
+        p.period === 'monthly' &&
+        p.interval === 1
+    );
+    if (match) {
+      cachedPlanId = match.id;
+      return match.id;
+    }
+  } catch (_) {}
+  const plan = await razorpay.plans.create({
+    period: 'monthly',
+    interval: 1,
+    item: {
+      name: 'MacroSnap Pro',
+      amount: 2900, // ₹29 in paise
+      currency: 'INR',
+      description: 'MacroSnap Pro monthly subscription',
+    },
+    notes: { app: 'macrosnap' },
+  });
+  cachedPlanId = plan.id;
+  return plan.id;
+}
 
 app.use((err, req, res, next) => {
   if (err.type === 'entity.parse.failed') return res.status(200).json({ ok: true });
@@ -58,13 +97,28 @@ async function initDB(retries = 5) {
             serving TEXT DEFAULT '',
             created_at TIMESTAMPTZ DEFAULT NOW()
           );
-        `);
+          CREATE TABLE IF NOT EXISTS habit_data (
+            phone TEXT PRIMARY KEY,
+            habits JSONB NOT NULL DEFAULT '[]'::jsonb,
+            water_log JSONB NOT NULL DEFAULT '{}'::jsonb,
+            water_goal INTEGER DEFAULT 8,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS subscriptions (
+            id TEXT PRIMARY KEY,
+            phone TEXT,
+            status TEXT DEFAULT 'created',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+          );
+        `);;
         try { await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT'); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_count INTEGER DEFAULT 0"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_month INTEGER DEFAULT 0"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by TEXT"); } catch (_) {}
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_id TEXT"); } catch (_) {}
         try { await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_code ON users (referral_code)"); } catch (_) {}
         await client.query(`
           CREATE TABLE IF NOT EXISTS payments (
@@ -389,6 +443,53 @@ app.post('/meals/sync', async (req, res) => {
   }
 });
 
+// ─── Habits & Water Log backup ────────────────────────────────────────
+// Stores the user's full habit list + water log as JSON so the app can
+// restore them after a reinstall. The Flutter app's MealSyncService hits
+// /habits/sync and /habits/list/:phone — these were MISSING, which is why
+// synced habits never came back after reinstalling the app.
+app.post('/habits/sync', async (req, res) => {
+  try {
+    const { phone, habits, water_log, water_goal } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    if (!Array.isArray(habits)) return res.status(400).json({ error: 'habits must be an array' });
+    await pool.query(
+      `INSERT INTO habit_data (phone, habits, water_log, water_goal, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (phone) DO UPDATE SET
+         habits = EXCLUDED.habits,
+         water_log = EXCLUDED.water_log,
+         water_goal = EXCLUDED.water_goal,
+         updated_at = NOW()`,
+      [phone, JSON.stringify(habits), JSON.stringify(water_log || {}), water_goal || 8]
+    );
+    res.json({ synced: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/habits/list/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const result = await pool.query(
+      'SELECT habits, water_log, water_goal FROM habit_data WHERE phone = $1',
+      [phone]
+    );
+    const row = result.rows[0];
+    if (!row) {
+      return res.json({ habits: [], water_log: {}, water_goal: 8 });
+    }
+    res.json({
+      habits: row.habits || [],
+      water_log: row.water_log || {},
+      water_goal: row.water_goal || 8,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/subscribe', async (req, res) => {
   try {
     const { phone } = req.body;
@@ -411,28 +512,44 @@ app.post('/unsubscribe', async (req, res) => {
   }
 });
 
-// ─── Razorpay: Create Order ────────────────────────────────────────────────
-app.post('/payment/create-order', async (req, res) => {
+// ─── Razorpay: Create Recurring Subscription ───────────────────────────────
+// Real ₹29/month recurring billing: creates a Razorpay Subscription (auto-
+// charges every month) instead of a one-time order. The app opens checkout
+// with the returned subscription_id; Razorpay then charges the customer
+// automatically each billing cycle and fires webhooks we verify below.
+app.post('/payment/create-subscription', async (req, res) => {
   try {
-    const { phone, amount, currency } = req.body;
+    const { phone, name, email } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     if (!process.env.RAZORPAY_KEY_ID) {
       return res.status(500).json({ error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env' });
     }
 
-    const options = {
-      amount: amount || 2900, // ₹29 in paise by default
-      currency: currency || 'INR',
-      receipt: `macrosnap_${phone}_${Date.now()}`,
-      notes: { phone },
-    };
+    const planId = await getPlanId();
 
-    const order = await razorpay.orders.create(options);
+    const subscription = await razorpay.subscriptions.create({
+      plan_id: planId,
+      total_count: 12, // 12 monthly charges; user can cancel anytime
+      customer_notify: 1,
+      notes: { phone },
+      customer: {
+        name: name || 'MacroSnap User',
+        contact: phone,
+        email: email || undefined,
+      },
+    });
+
+    // Track the subscription → phone mapping so webhooks can find the user.
+    await pool.query(
+      `INSERT INTO subscriptions (id, phone, status) VALUES ($1, $2, $3)
+       ON CONFLICT (id) DO UPDATE SET phone = EXCLUDED.phone, status = EXCLUDED.status`,
+      [subscription.id, phone, subscription.status || 'created']
+    );
 
     res.json({
-      order_id: order.id,
-      amount: order.amount,
-      currency: order.currency,
+      subscription_id: subscription.id,
+      amount: 2900,
+      currency: 'INR',
       razorpay_key: process.env.RAZORPAY_KEY_ID,
     });
   } catch (e) {
@@ -440,16 +557,29 @@ app.post('/payment/create-order', async (req, res) => {
   }
 });
 
-// ─── Razorpay: Verify Payment ──────────────────────────────────────────────
+// ─── Razorpay: Verify Payment (order or subscription) ──────────────────────
+// Supports both the legacy one-time order flow and the new recurring
+// subscription flow. Signature format differs:
+//   order:        HMAC(order_id|payment_id)
+//   subscription: HMAC(subscription_id|payment_id)
 app.post('/payment/verify', async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    const {
+      razorpay_order_id,
+      razorpay_subscription_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = req.body;
+    if (!razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
     // Verify signature using HMAC SHA256
-    const body = `${razorpay_order_id}|${razorpay_payment_id}`;
+    const signingId = razorpay_subscription_id || razorpay_order_id;
+    if (!signingId) {
+      return res.status(400).json({ error: 'Missing order or subscription id' });
+    }
+    const body = `${signingId}|${razorpay_payment_id}`;
     const expectedSignature = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
       .update(body)
@@ -484,7 +614,104 @@ app.post('/payment/verify', async (req, res) => {
       [phone]
     );
 
+    // Save the active subscription id on the user row
+    if (razorpay_subscription_id) {
+      try {
+        await pool.query(
+          'UPDATE users SET subscription_id = $1 WHERE phone = $2',
+          [razorpay_subscription_id, phone]
+        );
+      } catch (e) {
+        console.error('subscription_id save failed:', e.message);
+      }
+    }
+
     res.json({ success: true, subscribed: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Razorpay: Webhook (recurring billing lifecycle) ───────────────────────
+// Razorpay calls this on every subscription event: initial charge, monthly
+// auto-charges, pauses, cancellations, failures. We verify the HMAC signature
+// against the raw body, then update the user's Pro status accordingly so
+// access stays in sync even when the app never re-opens.
+//
+// Events handled:
+//   subscription.activated / payment.captured / subscription.charged → Pro ON
+//   subscription.completed (all 12 charges paid)                      → Pro ON
+//   subscription.cancelled / subscription.paused / subscription.halted→ Pro OFF
+app.post('/payment/webhook', async (req, res) => {
+  try {
+    const signature = req.headers['x-razorpay-signature'];
+    if (!signature) return res.status(400).json({ error: 'Missing signature' });
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!secret) {
+      console.error('Razorpay webhook received but RAZORPAY_WEBHOOK_SECRET is not set — add it to Railway env and register this URL in the Razorpay dashboard.');
+      return res.status(500).json({ error: 'Webhook secret not configured' });
+    }
+
+    const rawBody = (req.rawBody || Buffer.from(JSON.stringify(req.body))).toString();
+    const expected = crypto
+      .createHmac('sha256', secret)
+      .update(rawBody)
+      .digest();
+    const received = Buffer.from(signature, 'hex');
+    // Timing-safe comparison (constant length guard first so mismatched
+    // lengths can't throw in timingSafeEqual).
+    if (received.length !== expected.length ||
+        !crypto.timingSafeEqual(received, expected)) {
+      return res.status(400).json({ error: 'Invalid webhook signature' });
+    }
+
+    const event = req.body;
+    const sub = event?.payload?.subscription?.entity;
+    const payment = event?.payload?.payment?.entity;
+    const subscriptionId = sub?.id || payment?.subscription_id;
+    if (!subscriptionId) return res.json({ received: true });
+
+    // Find the phone for this subscription (fall back to payment notes).
+    let phone = null;
+    try {
+      const row = await pool.query('SELECT phone FROM subscriptions WHERE id = $1', [subscriptionId]);
+      phone = row.rows[0]?.phone || null;
+    } catch (_) {}
+    if (!phone && payment?.notes?.phone) phone = payment.notes.phone;
+    if (!phone) return res.json({ received: true });
+
+    const eventType = event?.event || '';
+    // Activate on first charge + each monthly auto-charge. NOTE: Razorpay
+    // subscriptions have a max of 12 charges, then subscription.completed
+    // fires — we treat that as the term ending (Pro off, user re-subscribes)
+    // rather than giving free Pro forever after month 12.
+    const turnOn =
+      eventType.includes('activated') ||
+      eventType.includes('captured') ||
+      eventType === 'subscription.charged';
+    const turnOff =
+      eventType === 'subscription.completed' ||
+      eventType.includes('cancelled') ||
+      eventType.includes('paused') ||
+      eventType.includes('halted') ||
+      eventType.includes('failed');
+
+    if (turnOn) {
+      await pool.query(
+        'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true, subscription_id = $2',
+        [phone, subscriptionId]
+      );
+      try {
+        await pool.query('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'active', subscriptionId]);
+      } catch (_) {}
+    } else if (turnOff) {
+      await pool.query('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
+      try {
+        await pool.query('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'cancelled', subscriptionId]);
+      } catch (_) {}
+    }
+
+    res.json({ received: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
