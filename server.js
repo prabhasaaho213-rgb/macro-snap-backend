@@ -3,6 +3,7 @@ const express = require('express');
 const multer = require('multer');
 const sharp = require('sharp');
 const { Pool } = require('pg');
+const firestore = require('./firestore');
 
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -20,6 +21,7 @@ app.use((req, res, next) => {
 });
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+firestore.init();
 
 // Initialize Razorpay
 const razorpay = new Razorpay({
@@ -234,6 +236,13 @@ Rules: 1 dish entry per visible item (rice, dal, sabzi, roti, salad, curd, pickl
     const updated = phone ? await pool.query('SELECT scan_count FROM users WHERE phone = $1', [phone]) : null;
     const scansUsed = updated?.rows[0]?.scan_count || 0;
 
+    // Firestore mirror: scan counters stay in sync (best-effort).
+    if (phone) {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) {
+        await firestore.set('users/' + fUid, { scanCount: scansUsed, scanMonth: currentMonth }, { merge: true });
+      }
+    }
     let dishes = json.dishes;
     if (!dishes || !Array.isArray(dishes) || dishes.length === 0) {
       dishes = [{
@@ -339,6 +348,19 @@ app.post('/register', async (req, res) => {
       await pool.query('INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING', [identifier]);
     }
     const user = await pool.query('SELECT * FROM users WHERE phone = $1', [identifier]);
+    // Firestore mirror: user doc + identifier index (best-effort).
+    {
+      const fUid = await firestore.resolveUid(identifier);
+      if (fUid) {
+        await firestore.set('users/' + fUid, {
+          identifier: identifier,
+          email: email || null,
+          name: name || '',
+          subscribed: user.rows[0].subscribed,
+        }, { merge: true });
+        await firestore.set('userIndex/' + identifier, { uid: fUid, name: name || '' }, { merge: true });
+      }
+    }
     res.json({ phone: user.rows[0].phone, subscribed: user.rows[0].subscribed });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -367,6 +389,14 @@ app.post('/referral/generate', async (req, res) => {
       if (dup.rows.length === 0) break;
     }
     await pool.query('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
+    // Firestore mirror: referral code on the user + referrals index.
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) {
+        await firestore.set('users/' + fUid, { referralCode: code }, { merge: true });
+        await firestore.set('referrals/' + code, { uid: fUid, identifier: phone, createdAt: new Date() }, { merge: true });
+      }
+    }
     res.json({ referral_code: code });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -387,6 +417,14 @@ app.get('/referral/my-code/:phone', async (req, res) => {
       await pool.query('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
       result = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
     }
+    // Firestore mirror (best-effort).
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid && result.rows[0]?.referral_code) {
+        await firestore.set('users/' + fUid, { referralCode: result.rows[0].referral_code }, { merge: true });
+        await firestore.set('referrals/' + result.rows[0].referral_code, { uid: fUid, identifier: phone, createdAt: new Date() }, { merge: true });
+      }
+    }
     res.json({ referral_code: result.rows[0].referral_code });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -404,6 +442,17 @@ app.post('/referral/apply', async (req, res) => {
     if (newUser.rows[0]?.referred_by) return res.status(400).json({ error: 'Already used a referral code' });
     await pool.query('UPDATE users SET referred_by = $1, subscribed = true WHERE phone = $2', [code.toUpperCase(), phone]);
     await pool.query('UPDATE users SET subscribed = true WHERE phone = $1', [referrer.rows[0].phone]);
+    // Firestore mirror: grant both users Pro + mark referredBy (best-effort).
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) {
+        await firestore.set('users/' + fUid, { subscribed: true, referredBy: code.toUpperCase() }, { merge: true });
+      }
+      const refUid = await firestore.resolveUid(referrer.rows[0].phone);
+      if (refUid) {
+        await firestore.set('users/' + refUid, { subscribed: true }, { merge: true });
+      }
+    }
     res.json({ subscribed: true, referrer: referrer.rows[0].phone });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -420,14 +469,47 @@ app.get('/meals/:phone', async (req, res) => {
   }
 });
 
+// ─── Meal restore/remove aliases the app actually calls ─────────────────
+// The app's MealSyncService always used GET /meals/list/:phone and
+// POST /meals/remove, which never existed on the server (restore and delete
+// were silently 404ing). These mirror the Postgres + Firestore behaviour.
+app.get('/meals/list/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const result = await pool.query('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
+    res.json(result.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/meals/remove', async (req, res) => {
+  try {
+    const { phone, meal_id } = req.body;
+    if (!phone || !meal_id) return res.status(400).json({ error: 'Phone and meal_id required' });
+    await pool.query('DELETE FROM meals WHERE id = $1 AND phone = $2', [meal_id, phone]);
+    // Firestore mirror (best-effort)
+    const fUid = await firestore.resolveUid(phone);
+    if (fUid) {
+      await firestore.del('meals/' + meal_id);
+    }
+    res.json({ removed: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/meals/sync', async (req, res) => {
   try {
-    const { phone, meals } = req.body;
-    if (!phone || !meals) return res.status(400).json({ error: 'Phone and meals required' });
+    const { phone, meals, meal } = req.body;
+    // The app's single-meal sync posts { phone, meal }; the bulk path posts
+    // { phone, meals: [...] }. Accept both so Firestore mirrors real traffic.
+    const mealList = Array.isArray(meals) ? meals : (meal ? [meal] : null);
+    if (!phone || !mealList) return res.status(400).json({ error: 'Phone and meals required' });
     const client = await pool.connect();
     try {
       await client.query('DELETE FROM meals WHERE phone = $1', [phone]);
-      for (const meal of meals) {
+      for (const meal of mealList) {
         await client.query(
           `INSERT INTO meals (id, phone, date, name, category, calories, protein, carbs, fats, fiber, serving)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
@@ -436,6 +518,38 @@ app.post('/meals/sync', async (req, res) => {
       }
     } finally {
       client.release();
+    }
+
+    // Firestore mirror: replace the user's meal docs to match Postgres
+    // (best-effort — Postgres stays the source of truth in Phase 1).
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) {
+        try {
+          const col = firestore.getDb().collection('meals');
+          const snap = await col.where('uid', '==', fUid).get();
+          const batch = firestore.getDb().batch();
+          snap.docs.forEach((d) => batch.delete(d.ref));
+          for (const m of mealList) {
+            batch.set(col.doc(m.id), {
+              uid: fUid,
+              date: m.date ? new Date(m.date) : new Date(),
+              name: m.name || '',
+              category: m.category || '',
+              calories: m.calories || 0,
+              protein: m.protein || 0,
+              carbs: m.carbs || 0,
+              fats: m.fats || 0,
+              fiber: m.fiber || 0,
+              serving: m.serving || '',
+              createdAt: new Date(),
+            });
+          }
+          await batch.commit();
+        } catch (e) {
+          console.error('Firestore meals mirror failed:', e.message);
+        }
+      }
     }
     res.json({ synced: true });
   } catch (e) {
@@ -463,6 +577,20 @@ app.post('/habits/sync', async (req, res) => {
          updated_at = NOW()`,
       [phone, JSON.stringify(habits), JSON.stringify(water_log || {}), water_goal || 8]
     );
+
+    // Firestore mirror: upsert the user's habitData doc (matches the
+    // Postgres ON CONFLICT upsert; best-effort).
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) {
+        await firestore.set('habitData/' + fUid, {
+          habits: habits,
+          waterLog: water_log || {},
+          waterGoal: water_goal || 8,
+          updatedAt: new Date(),
+        });
+      }
+    }
     res.json({ synced: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -495,6 +623,11 @@ app.post('/subscribe', async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     await pool.query('INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true', [phone]);
+    // Firestore mirror (best-effort).
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) await firestore.set('users/' + fUid, { subscribed: true }, { merge: true });
+    }
     res.json({ subscribed: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -506,6 +639,11 @@ app.post('/unsubscribe', async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     await pool.query('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
+    // Firestore mirror (best-effort).
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) await firestore.set('users/' + fUid, { subscribed: false }, { merge: true });
+    }
     res.json({ subscribed: false });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -626,6 +764,30 @@ app.post('/payment/verify', async (req, res) => {
       }
     }
 
+    // Firestore mirror: activation + subscription + payment records
+    // (best-effort — Postgres stays authoritative in Phase 1).
+    {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid) {
+        await firestore.set('users/' + fUid, { subscribed: true, subscriptionId: razorpay_subscription_id || null }, { merge: true });
+        if (razorpay_subscription_id) {
+          await firestore.set('subscriptions/' + razorpay_subscription_id, {
+            uid: fUid,
+            identifier: phone,
+            status: 'active',
+            createdAt: new Date(),
+          }, { merge: true });
+        }
+        await firestore.set('payments/' + razorpay_payment_id, {
+          uid: fUid,
+          identifier: phone,
+          transactionRef: razorpay_payment_id,
+          amount: (payment.amount || 2900) / 100,
+          status: 'approved',
+          createdAt: new Date(),
+        }, { merge: true });
+      }
+    }
     res.json({ success: true, subscribed: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -704,11 +866,31 @@ app.post('/payment/webhook', async (req, res) => {
       try {
         await pool.query('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'active', subscriptionId]);
       } catch (_) {}
+      // Firestore mirror: activate user + subscription doc (best-effort).
+      {
+        const fUid = await firestore.resolveUid(phone);
+        if (fUid) {
+          await firestore.set('users/' + fUid, { subscribed: true, subscriptionId: subscriptionId || null }, { merge: true });
+        }
+        if (subscriptionId) {
+          await firestore.set('subscriptions/' + subscriptionId, { uid: fUid || null, identifier: phone, status: sub?.status || 'active', updatedAt: new Date() }, { merge: true });
+        }
+      }
     } else if (turnOff) {
       await pool.query('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
       try {
         await pool.query('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'cancelled', subscriptionId]);
       } catch (_) {}
+      // Firestore mirror: deactivate user + subscription doc (best-effort).
+      {
+        const fUid = await firestore.resolveUid(phone);
+        if (fUid) {
+          await firestore.set('users/' + fUid, { subscribed: false }, { merge: true });
+        }
+        if (subscriptionId) {
+          await firestore.set('subscriptions/' + subscriptionId, { status: sub?.status || 'cancelled', updatedAt: new Date() }, { merge: true });
+        }
+      }
     }
 
     res.json({ received: true });
