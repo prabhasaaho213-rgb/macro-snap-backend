@@ -185,14 +185,14 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
     const body = JSON.stringify({
       contents: [{
         parts: [
-          { text: `You are a professional Indian nutritionist. The photo likely contains one or more food items (e.g. a full thali). Identify EVERY visible dish and return ONLY valid JSON:
+          { text: `You are a professional nutritionist. The photo shows food — it may be from ANY cuisine: Indian, South Asian, Western, bakery & desserts, street food, fruits, packaged foods, etc. Name EVERY visible food item ACCURATELY as it actually is (for example "Chocolate cake", "Donut", "Rice with dal", "Butter chicken", "Pizza", "Banana"). NEVER force a food into a different dish: a cake is a cake, a cookie is a cookie — do NOT relabel desserts or baked goods as Indian sweets. If the food is a dessert, baked good, snack, or any non-Indian item, identify it precisely and use its standard nutrition data. Return ONLY valid JSON:
 {
   "description": "brief summary of what was detected",
   "confidence": estimated accuracy 0-1,
   "dishes": [
     {
-      "name": "dish name in English",
-      "portion_description": "estimated portion like '1 small katori' or '2 rotis'",
+      "name": "accurate food name in English",
+      "portion_description": "estimated portion like '1 small bowl' or '1 slice (80g)'",
       "calories_per_100g": integer,
       "protein_g_per_100g": number,
       "carbs_g_per_100g": number,
@@ -203,7 +203,7 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
     }
   ]
 }
-Rules: 1 dish entry per visible item (rice, dal, sabzi, roti, salad, curd, pickle). Be specific about portions. Use Indian food data. Return ONLY raw JSON. No markdown. No backticks.` },
+Rules: 1 dish entry per visible item. Be specific about the portion. Use standard nutrition data. If unsure, name the most likely food rather than guessing an Indian equivalent. Return ONLY raw JSON. No markdown. No backticks.` },
           { inlineData: { mimeType: 'image/jpeg', data: base64 } }
         ]
       }]
