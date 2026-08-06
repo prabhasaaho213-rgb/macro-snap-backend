@@ -4,7 +4,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "build": "npm install"
+    "build": "npm install",
+    "backfill": "node backfill_firestore.js"
   },
   "engines": {
     "node": ">=18.0.0"
