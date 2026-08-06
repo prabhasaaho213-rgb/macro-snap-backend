@@ -20,14 +20,40 @@ app.use((req, res, next) => {
   next();
 });
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+// Postgres is now OPTIONAL. When DATABASE_URL is unset (e.g. Vercel free
+// tier) the server runs fully on Firestore: every Postgres call degrades
+// gracefully through the safe dbq() helper below and scan limits /
+// subscription state are read from Firestore instead.
+const dbAvailable = !!process.env.DATABASE_URL;
+const pool = dbAvailable
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
 firestore.init();
 
-// Initialize Razorpay
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+// Safe DB query: never throws when Postgres is absent or down.
+async function dbq(sql, params) {
+  if (!pool) return { rows: [] };
+  try {
+    return await pool.query(sql, params);
+  } catch (e) {
+    console.error('DB query failed (continuing without Postgres):', e.message);
+    return { rows: [] };
+  }
+}
+
+// Gemini model — the 2.5 generation is retired for new API keys (2026), so
+// the default is a current vision-capable lite model. Override via GEMINI_MODEL.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+
+// Razorpay is optional: when the keys are unset the server still runs (the
+// payment endpoints return a clear 'not configured' error instead).
+const razorpay =
+  process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
+    ? new Razorpay({
+        key_id: process.env.RAZORPAY_KEY_ID,
+        key_secret: process.env.RAZORPAY_KEY_SECRET,
+      })
+    : null;
 
 app.get('/', (req, res) => res.send('OK'));
 
@@ -36,6 +62,7 @@ app.get('/', (req, res) => res.send('OK'));
 // plan if present (idempotent across redeploys) and create one otherwise.
 let cachedPlanId = null;
 async function getPlanId() {
+  if (!razorpay) return null;
   if (cachedPlanId) return cachedPlanId;
   try {
     const plans = await razorpay.plans.all({ count: 100 });
@@ -73,6 +100,10 @@ app.use((err, req, res, next) => {
 });
 
 async function initDB(retries = 5) {
+  if (!dbAvailable) {
+    console.log('DATABASE_URL not set — running without Postgres (Firestore only)');
+    return;
+  }
   for (let i = 0; i < retries; i++) {
     try {
       const client = await pool.connect();
@@ -161,21 +192,39 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
     if (phone) {
       const now = new Date();
       const currentMonth = now.getFullYear() * 12 + now.getMonth();
-      const user = await pool.query('SELECT subscribed, scan_count, scan_month FROM users WHERE phone = $1', [phone]);
-      if (user.rows.length > 0) {
-        const { subscribed, scan_count, scan_month } = user.rows[0];
-        if (!subscribed) {
-          if (scan_month !== currentMonth) {
-            await pool.query('UPDATE users SET scan_count = 0, scan_month = $1 WHERE phone = $2', [currentMonth, phone]);
-          }
-          const count = scan_month === currentMonth ? (scan_count || 0) : 0;
-          if (count >= SCAN_LIMIT_FREE) {
-            return res.status(403).json({ error: 'scan_limit_reached', scans_used: count, scans_limit: SCAN_LIMIT_FREE });
-          }
+      const fUid = await firestore.resolveUid(phone);
+      let subscribed = false;
+      let count = 0;
+      let scanMonth = 0;
+      if (dbAvailable) {
+        // Postgres path (source of truth when a DB is configured).
+        const user = await dbq('SELECT subscribed, scan_count, scan_month FROM users WHERE phone = $1', [phone]);
+        if (user.rows.length > 0) {
+          subscribed = !!user.rows[0].subscribed;
+          count = user.rows[0].scan_count || 0;
+          scanMonth = user.rows[0].scan_month || 0;
+        } else {
+          await dbq('INSERT INTO users (phone, scan_count, scan_month) VALUES ($1, 0, $2) ON CONFLICT (phone) DO NOTHING', [phone, currentMonth]);
         }
-      } else {
-        await pool.query('INSERT INTO users (phone, scan_count, scan_month) VALUES ($1, 0, $2) ON CONFLICT (phone) DO NOTHING', [phone, currentMonth]);
+      } else if (fUid) {
+        // DB-less path: scan counters live in users/{uid} (Firestore).
+        const doc = await firestore.getDb().collection('users').doc(fUid).get();
+        const d = doc.exists ? doc.data() : {};
+        subscribed = d.subscribed === true;
+        count = d.scanCount || 0;
+        scanMonth = d.scanMonth || 0;
       }
+      if (!subscribed) {
+        if (scanMonth !== currentMonth) {
+          count = 0;
+          scanMonth = currentMonth;
+        }
+        if (count >= SCAN_LIMIT_FREE) {
+          return res.status(403).json({ error: 'scan_limit_reached', scans_used: count, scans_limit: SCAN_LIMIT_FREE });
+        }
+      }
+      // Carry state so the post-analysis increment updates the right store.
+      req._scan = { phone, fUid, currentMonth, count, dbAvailable };
     }
 
     const key = process.env.GEMINI_KEY;
@@ -209,7 +258,7 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
       }]
     });
 
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`, {
+    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body
@@ -224,21 +273,18 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
     const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
     const json = JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
 
-    if (phone) {
-      await pool.query(
-        'UPDATE users SET scan_count = COALESCE(scan_count, 0) + 1 WHERE phone = $1',
-        [phone]
-      );
-    }
-
     const now = new Date();
     const currentMonth = now.getFullYear() * 12 + now.getMonth();
-    const updated = phone ? await pool.query('SELECT scan_count FROM users WHERE phone = $1', [phone]) : null;
-    const scansUsed = updated?.rows[0]?.scan_count || 0;
-
-    // Firestore mirror: scan counters stay in sync (best-effort).
-    if (phone) {
-      const fUid = await firestore.resolveUid(phone);
+    let scansUsed = 0;
+    if (req._scan) {
+      const { phone, fUid, count, dbAvailable: hadDb } = req._scan;
+      scansUsed = count + 1;
+      if (hadDb) {
+        await dbq('UPDATE users SET scan_count = COALESCE(scan_count, 0) + 1 WHERE phone = $1', [phone]);
+        const updated = await dbq('SELECT scan_count FROM users WHERE phone = $1', [phone]);
+        scansUsed = updated?.rows[0]?.scan_count || scansUsed;
+      }
+      // Firestore mirror — also the counter's source when Postgres is absent.
       if (fUid) {
         await firestore.set('users/' + fUid, { scanCount: scansUsed, scanMonth: currentMonth }, { merge: true });
       }
@@ -298,7 +344,7 @@ app.post('/generate-diet-plan', async (req, res) => {
     const prompt = `You are an Indian nutritionist. Generate a personalized ONE-DAY Indian diet plan.
 User: ${gender}, ${age} yrs, ${weight}kg, ${height}cm, BMI ${bmi.toFixed(1)}.
 Goal: ${goal}, Activity: ${activity}.
-TDEE: ${tdee.round()} kcal, Target: ${calTarget.round()} kcal/day.
+TDEE: ${Math.round(tdee)} kcal, Target: ${Math.round(calTarget)} kcal/day.
 Macros: Protein ${proteinTarget.toFixed(0)}g, Carbs ${carbTarget.toFixed(0)}g, Fats ${fatTarget.toFixed(0)}g.
 
 Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
@@ -313,7 +359,7 @@ Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
 }`;
 
     const key = process.env.GEMINI_KEY;
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`, {
+    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
@@ -328,7 +374,7 @@ Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
     const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
     const plan = JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
 
-    res.json({ bmi: bmi.toFixed(1), bmr: bmr.round(), tdee: tdee.round(), targetCalories: calTarget.round(), targetProtein: proteinTarget.toFixed(0), targetCarbs: carbTarget.toFixed(0), targetFats: fatTarget.toFixed(0), plan });
+    res.json({ bmi: bmi.toFixed(1), bmr: Math.round(bmr), tdee: Math.round(tdee), targetCalories: Math.round(calTarget), targetProtein: proteinTarget.toFixed(0), targetCarbs: carbTarget.toFixed(0), targetFats: fatTarget.toFixed(0), plan });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -340,14 +386,15 @@ app.post('/register', async (req, res) => {
     if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
     const identifier = phone || email;
     if (email && name) {
-      await pool.query(
+      await dbq(
         'INSERT INTO users (phone, email, name) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET email = $2, name = $3',
         [identifier, email, name]
       );
     } else {
-      await pool.query('INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING', [identifier]);
+      await dbq('INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING', [identifier]);
     }
-    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [identifier]);
+    const user = await dbq('SELECT * FROM users WHERE phone = $1', [identifier]);
+    const row = user.rows[0] || {};
     // Firestore mirror: user doc + identifier index (best-effort).
     {
       const fUid = await firestore.resolveUid(identifier);
@@ -356,12 +403,12 @@ app.post('/register', async (req, res) => {
           identifier: identifier,
           email: email || null,
           name: name || '',
-          subscribed: user.rows[0].subscribed,
+          subscribed: row.subscribed,
         }, { merge: true });
         await firestore.set('userIndex/' + identifier, { uid: fUid, name: name || '' }, { merge: true });
       }
     }
-    res.json({ phone: user.rows[0].phone, subscribed: user.rows[0].subscribed });
+    res.json({ phone: row.phone || identifier, subscribed: row.subscribed || false });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -378,17 +425,17 @@ app.post('/referral/generate', async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
-    const existing = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+    const existing = await dbq('SELECT referral_code FROM users WHERE phone = $1', [phone]);
     if (existing.rows[0]?.referral_code) {
       return res.json({ referral_code: existing.rows[0].referral_code });
     }
     let code;
     for (let attempt = 0; attempt < 10; attempt++) {
       code = generateReferralCode();
-      const dup = await pool.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+      const dup = await dbq('SELECT 1 FROM users WHERE referral_code = $1', [code]);
       if (dup.rows.length === 0) break;
     }
-    await pool.query('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
+    await dbq('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
     // Firestore mirror: referral code on the user + referrals index.
     {
       const fUid = await firestore.resolveUid(phone);
@@ -406,26 +453,27 @@ app.post('/referral/generate', async (req, res) => {
 app.get('/referral/my-code/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
-    let result = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+    let code = null;
+    let result = await dbq('SELECT referral_code FROM users WHERE phone = $1', [phone]);
     if (!result.rows[0]?.referral_code) {
-      let code;
       for (let attempt = 0; attempt < 10; attempt++) {
         code = generateReferralCode();
-        const dup = await pool.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+        const dup = await dbq('SELECT 1 FROM users WHERE referral_code = $1', [code]);
         if (dup.rows.length === 0) break;
       }
-      await pool.query('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
-      result = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+      await dbq('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
+    } else {
+      code = result.rows[0].referral_code;
     }
-    // Firestore mirror (best-effort).
+    // Firestore mirror (best-effort) — also the DB-less source of truth.
     {
       const fUid = await firestore.resolveUid(phone);
-      if (fUid && result.rows[0]?.referral_code) {
-        await firestore.set('users/' + fUid, { referralCode: result.rows[0].referral_code }, { merge: true });
-        await firestore.set('referrals/' + result.rows[0].referral_code, { uid: fUid, identifier: phone, createdAt: new Date() }, { merge: true });
+      if (fUid && code) {
+        await firestore.set('users/' + fUid, { referralCode: code }, { merge: true });
+        await firestore.set('referrals/' + code, { uid: fUid, identifier: phone, createdAt: new Date() }, { merge: true });
       }
     }
-    res.json({ referral_code: result.rows[0].referral_code });
+    res.json({ referral_code: code });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -435,25 +483,45 @@ app.post('/referral/apply', async (req, res) => {
   try {
     const { phone, code } = req.body;
     if (!phone || !code) return res.status(400).json({ error: 'Phone and code required' });
-    const referrer = await pool.query('SELECT phone, subscribed FROM users WHERE referral_code = $1', [code.toUpperCase()]);
-    if (referrer.rows.length === 0) return res.status(404).json({ error: 'Invalid referral code' });
-    if (referrer.rows[0].phone === phone) return res.status(400).json({ error: 'Cannot use your own code' });
-    const newUser = await pool.query('SELECT referred_by FROM users WHERE phone = $1', [phone]);
+    const upper = code.toUpperCase();
+    let referrerPhone = null;
+    let referrerUid = null;
+
+    // Postgres lookup first (legacy), then the Firestore referrals index.
+    const referrer = await dbq('SELECT phone FROM users WHERE referral_code = $1', [upper]);
+    if (referrer.rows[0]?.phone) {
+      referrerPhone = referrer.rows[0].phone;
+      referrerUid = await firestore.resolveUid(referrerPhone);
+    } else if (firestore.isEnabled()) {
+      try {
+        const refDoc = await firestore.getDb().collection('referrals').doc(upper).get();
+        if (refDoc.exists) {
+          referrerUid = refDoc.data().uid || null;
+        }
+      } catch (_) {}
+    }
+    if (!referrerPhone && !referrerUid) return res.status(404).json({ error: 'Invalid referral code' });
+    if (referrerPhone === phone) return res.status(400).json({ error: 'Cannot use your own code' });
+
+    const newUser = await dbq('SELECT referred_by FROM users WHERE phone = $1', [phone]);
     if (newUser.rows[0]?.referred_by) return res.status(400).json({ error: 'Already used a referral code' });
-    await pool.query('UPDATE users SET referred_by = $1, subscribed = true WHERE phone = $2', [code.toUpperCase(), phone]);
-    await pool.query('UPDATE users SET subscribed = true WHERE phone = $1', [referrer.rows[0].phone]);
-    // Firestore mirror: grant both users Pro + mark referredBy (best-effort).
+    await dbq('UPDATE users SET referred_by = $1, subscribed = true WHERE phone = $2', [upper, phone]);
+    if (referrerPhone) {
+      await dbq('UPDATE users SET subscribed = true WHERE phone = $1', [referrerPhone]);
+    }
+
+    // Firestore mirror: grant both users Pro + mark referredBy (best-effort,
+    // and the only path when Postgres is absent).
     {
       const fUid = await firestore.resolveUid(phone);
       if (fUid) {
-        await firestore.set('users/' + fUid, { subscribed: true, referredBy: code.toUpperCase() }, { merge: true });
+        await firestore.set('users/' + fUid, { subscribed: true, referredBy: upper }, { merge: true });
       }
-      const refUid = await firestore.resolveUid(referrer.rows[0].phone);
-      if (refUid) {
-        await firestore.set('users/' + refUid, { subscribed: true }, { merge: true });
+      if (referrerUid) {
+        await firestore.set('users/' + referrerUid, { subscribed: true }, { merge: true });
       }
     }
-    res.json({ subscribed: true, referrer: referrer.rows[0].phone });
+    res.json({ subscribed: true, referrer: referrerPhone || 'referred' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -462,7 +530,7 @@ app.post('/referral/apply', async (req, res) => {
 app.get('/meals/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
-    const result = await pool.query('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
+    const result = await dbq('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
     res.json(result.rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -476,7 +544,7 @@ app.get('/meals/:phone', async (req, res) => {
 app.get('/meals/list/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
-    const result = await pool.query('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
+    const result = await dbq('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
     res.json(result.rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -487,7 +555,7 @@ app.post('/meals/remove', async (req, res) => {
   try {
     const { phone, meal_id } = req.body;
     if (!phone || !meal_id) return res.status(400).json({ error: 'Phone and meal_id required' });
-    await pool.query('DELETE FROM meals WHERE id = $1 AND phone = $2', [meal_id, phone]);
+    await dbq('DELETE FROM meals WHERE id = $1 AND phone = $2', [meal_id, phone]);
     // Firestore mirror (best-effort)
     const fUid = await firestore.resolveUid(phone);
     if (fUid) {
@@ -506,18 +574,20 @@ app.post('/meals/sync', async (req, res) => {
     // { phone, meals: [...] }. Accept both so Firestore mirrors real traffic.
     const mealList = Array.isArray(meals) ? meals : (meal ? [meal] : null);
     if (!phone || !mealList) return res.status(400).json({ error: 'Phone and meals required' });
-    const client = await pool.connect();
-    try {
-      await client.query('DELETE FROM meals WHERE phone = $1', [phone]);
-      for (const meal of mealList) {
-        await client.query(
-          `INSERT INTO meals (id, phone, date, name, category, calories, protein, carbs, fats, fiber, serving)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
-          [meal.id, phone, meal.date, meal.name, meal.category, meal.calories, meal.protein, meal.carbs, meal.fats, meal.fiber, meal.serving]
-        );
+    if (dbAvailable) {
+      const client = await pool.connect();
+      try {
+        await client.query('DELETE FROM meals WHERE phone = $1', [phone]);
+        for (const meal of mealList) {
+          await client.query(
+            `INSERT INTO meals (id, phone, date, name, category, calories, protein, carbs, fats, fiber, serving)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+            [meal.id, phone, meal.date, meal.name, meal.category, meal.calories, meal.protein, meal.carbs, meal.fats, meal.fiber, meal.serving]
+          );
+        }
+      } finally {
+        client.release();
       }
-    } finally {
-      client.release();
     }
 
     // Firestore mirror: replace the user's meal docs to match Postgres
@@ -567,7 +637,7 @@ app.post('/habits/sync', async (req, res) => {
     const { phone, habits, water_log, water_goal } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     if (!Array.isArray(habits)) return res.status(400).json({ error: 'habits must be an array' });
-    await pool.query(
+    await dbq(
       `INSERT INTO habit_data (phone, habits, water_log, water_goal, updated_at)
        VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (phone) DO UPDATE SET
@@ -600,7 +670,7 @@ app.post('/habits/sync', async (req, res) => {
 app.get('/habits/list/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
-    const result = await pool.query(
+    const result = await dbq(
       'SELECT habits, water_log, water_goal FROM habit_data WHERE phone = $1',
       [phone]
     );
@@ -622,7 +692,7 @@ app.post('/subscribe', async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
-    await pool.query('INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true', [phone]);
+    await dbq('INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true', [phone]);
     // Firestore mirror (best-effort).
     {
       const fUid = await firestore.resolveUid(phone);
@@ -638,7 +708,7 @@ app.post('/unsubscribe', async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
-    await pool.query('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
+    await dbq('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
     // Firestore mirror (best-effort).
     {
       const fUid = await firestore.resolveUid(phone);
@@ -678,7 +748,7 @@ app.post('/payment/create-subscription', async (req, res) => {
     });
 
     // Track the subscription → phone mapping so webhooks can find the user.
-    await pool.query(
+    await dbq(
       `INSERT INTO subscriptions (id, phone, status) VALUES ($1, $2, $3)
        ON CONFLICT (id) DO UPDATE SET phone = EXCLUDED.phone, status = EXCLUDED.status`,
       [subscription.id, phone, subscription.status || 'created']
@@ -737,7 +807,7 @@ app.post('/payment/verify', async (req, res) => {
 
     // Store payment in database
     try {
-      await pool.query(
+      await dbq(
         `INSERT INTO payments (phone, transaction_ref, amount, status)
          VALUES ($1, $2, $3, 'approved')`,
         [phone, razorpay_payment_id, (payment.amount || 2900) / 100]
@@ -747,7 +817,7 @@ app.post('/payment/verify', async (req, res) => {
     }
 
     // Activate subscription
-    await pool.query(
+    await dbq(
       'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true',
       [phone]
     );
@@ -755,7 +825,7 @@ app.post('/payment/verify', async (req, res) => {
     // Save the active subscription id on the user row
     if (razorpay_subscription_id) {
       try {
-        await pool.query(
+        await dbq(
           'UPDATE users SET subscription_id = $1 WHERE phone = $2',
           [razorpay_subscription_id, phone]
         );
@@ -836,7 +906,7 @@ app.post('/payment/webhook', async (req, res) => {
     // Find the phone for this subscription (fall back to payment notes).
     let phone = null;
     try {
-      const row = await pool.query('SELECT phone FROM subscriptions WHERE id = $1', [subscriptionId]);
+      const row = await dbq('SELECT phone FROM subscriptions WHERE id = $1', [subscriptionId]);
       phone = row.rows[0]?.phone || null;
     } catch (_) {}
     if (!phone && payment?.notes?.phone) phone = payment.notes.phone;
@@ -859,12 +929,12 @@ app.post('/payment/webhook', async (req, res) => {
       eventType.includes('failed');
 
     if (turnOn) {
-      await pool.query(
+      await dbq(
         'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true, subscription_id = $2',
         [phone, subscriptionId]
       );
       try {
-        await pool.query('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'active', subscriptionId]);
+        await dbq('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'active', subscriptionId]);
       } catch (_) {}
       // Firestore mirror: activate user + subscription doc (best-effort).
       {
@@ -877,9 +947,9 @@ app.post('/payment/webhook', async (req, res) => {
         }
       }
     } else if (turnOff) {
-      await pool.query('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
+      await dbq('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
       try {
-        await pool.query('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'cancelled', subscriptionId]);
+        await dbq('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'cancelled', subscriptionId]);
       } catch (_) {}
       // Firestore mirror: deactivate user + subscription doc (best-effort).
       {
@@ -904,8 +974,8 @@ app.post('/payment/webhook', async (req, res) => {
 app.get('/payment/status/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
-    const user = await pool.query('SELECT subscribed FROM users WHERE phone = $1', [phone]);
-    const payments = await pool.query(
+    const user = await dbq('SELECT subscribed FROM users WHERE phone = $1', [phone]);
+    const payments = await dbq(
       'SELECT * FROM payments WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
       [phone]
     );
@@ -918,20 +988,32 @@ app.get('/payment/status/:phone', async (req, res) => {
   }
 });
 
-// --- Subscription verification (source of truth: Postgres) ---------------
+// --- Subscription verification (Firestore first, Postgres fallback) ------
 app.get('/subscription/status', async (req, res) => {
   try {
     const { phone, email } = req.query;
     if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
-    // Prefer the phone match (phone is the PK), then fall back to email so a
-    // matching email can never resolve to a different user's row.
+    const identifier = phone || email;
+
+    // Firestore is the source of truth (Phase 3) — check users/{uid} first.
+    const fUid = await firestore.resolveUid(identifier);
+    if (fUid && firestore.isEnabled()) {
+      try {
+        const doc = await firestore.getDb().collection('users').doc(fUid).get();
+        if (doc.exists && doc.data().subscribed === true) {
+          return res.json({ subscribed: true });
+        }
+      } catch (_) {}
+    }
+
+    // Postgres fallback (legacy / when Firestore has no user doc).
     let user = null;
     if (phone) {
-      const r = await pool.query('SELECT subscribed FROM users WHERE phone = $1 LIMIT 1', [phone]);
+      const r = await dbq('SELECT subscribed FROM users WHERE phone = $1 LIMIT 1', [phone]);
       user = r.rows[0] || null;
     }
     if (!user && email) {
-      const r = await pool.query('SELECT subscribed FROM users WHERE email = $1 LIMIT 1', [email]);
+      const r = await dbq('SELECT subscribed FROM users WHERE email = $1 LIMIT 1', [email]);
       user = r.rows[0] || null;
     }
     res.json({ subscribed: user?.subscribed || false });
@@ -940,5 +1022,11 @@ app.get('/subscription/status', async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`MacroSnap server on port ${port}`));
+// Vercel (serverless) imports this module as the request handler; local /
+// Railway runs call listen() directly.
+if (require.main === module) {
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => console.log(`MacroSnap server on port ${port}`));
+}
+
+module.exports = app;
