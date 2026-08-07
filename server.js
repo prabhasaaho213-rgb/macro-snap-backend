@@ -212,7 +212,6 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
         // Postgres path (source of truth when a DB is configured).
         const user = await dbq('SELECT subscribed, scan_count, scan_month FROM users WHERE phone = $1', [phone]);
         if (user.rows.length > 0) {
-          subscribed = !!user.rows[0].subscribed;
           count = user.rows[0].scan_count || 0;
           scanMonth = user.rows[0].scan_month || 0;
         } else {
@@ -222,10 +221,14 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
         // DB-less path: scan counters live in users/{uid} (Firestore).
         const doc = await firestore.getDb().collection('users').doc(fUid).get();
         const d = doc.exists ? doc.data() : {};
-        subscribed = d.subscribed === true;
         count = d.scanCount || 0;
         scanMonth = d.scanMonth || 0;
       }
+      // The owner is ALWAYS subscribed — the DB lookup above must never
+      // downgrade them. Without this, an admin whose stored row/doc says
+      // subscribed=false (e.g. never paid via Razorpay) gets 403'd at the
+      // free scan limit, exactly like a free user.
+      subscribed = subscribed || isAdminUser(phone);
       if (!subscribed) {
         if (scanMonth !== currentMonth) {
           count = 0;
