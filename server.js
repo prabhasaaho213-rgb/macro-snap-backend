@@ -184,6 +184,17 @@ async function prepareImage(buffer, mimetype) {
 
 const SCAN_LIMIT_FREE = 3;
 
+// The owner/admin account is always Pro — exempt from the free scan limit.
+// Mirrors SubscriptionService.adminEmail in the Flutter app. After Google
+// sign-in the app sends the user's email as the `phone` field, so a simple
+// case-insensitive match identifies the admin here.
+const ADMIN_EMAIL = 'prabhasaaho213@gmail.com';
+
+function isAdminUser(identifier) {
+  return typeof identifier === 'string' &&
+    identifier.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase();
+}
+
 app.post('/analyze', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
@@ -193,7 +204,8 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
       const now = new Date();
       const currentMonth = now.getFullYear() * 12 + now.getMonth();
       const fUid = await firestore.resolveUid(phone);
-      let subscribed = false;
+      // The owner is always subscribed, so the free limit never applies.
+      let subscribed = isAdminUser(phone);
       let count = 0;
       let scanMonth = 0;
       if (dbAvailable) {
@@ -278,15 +290,18 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
     let scansUsed = 0;
     if (req._scan) {
       const { phone, fUid, count, dbAvailable: hadDb } = req._scan;
-      scansUsed = count + 1;
-      if (hadDb) {
-        await dbq('UPDATE users SET scan_count = COALESCE(scan_count, 0) + 1 WHERE phone = $1', [phone]);
-        const updated = await dbq('SELECT scan_count FROM users WHERE phone = $1', [phone]);
-        scansUsed = updated?.rows[0]?.scan_count || scansUsed;
-      }
-      // Firestore mirror — also the counter's source when Postgres is absent.
-      if (fUid) {
-        await firestore.set('users/' + fUid, { scanCount: scansUsed, scanMonth: currentMonth }, { merge: true });
+      // The admin's scans are never counted — their account is always Pro.
+      if (!isAdminUser(phone)) {
+        scansUsed = count + 1;
+        if (hadDb) {
+          await dbq('UPDATE users SET scan_count = COALESCE(scan_count, 0) + 1 WHERE phone = $1', [phone]);
+          const updated = await dbq('SELECT scan_count FROM users WHERE phone = $1', [phone]);
+          scansUsed = updated?.rows[0]?.scan_count || scansUsed;
+        }
+        // Firestore mirror — also the counter's source when Postgres is absent.
+        if (fUid) {
+          await firestore.set('users/' + fUid, { scanCount: scansUsed, scanMonth: currentMonth }, { merge: true });
+        }
       }
     }
     let dishes = json.dishes;
@@ -994,6 +1009,9 @@ app.get('/subscription/status', async (req, res) => {
     const { phone, email } = req.query;
     if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
     const identifier = phone || email;
+
+    // The owner is always subscribed.
+    if (isAdminUser(identifier)) return res.json({ subscribed: true });
 
     // Firestore is the source of truth (Phase 3) — check users/{uid} first.
     const fUid = await firestore.resolveUid(identifier);
