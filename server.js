@@ -432,6 +432,22 @@ app.post('/register', async (req, res) => {
   }
 });
 
+// Returns the stored profile name for an identifier (phone or email) so the
+// app can restore a previously-chosen nickname after a reinstall / on a new
+// device — an existing user must never be re-asked for a nickname.
+app.get('/user/profile', async (req, res) => {
+  try {
+    const { phone, email } = req.query;
+    const identifier = phone || email;
+    if (!identifier) return res.status(400).json({ error: 'Phone or email required' });
+    const user = await dbq('SELECT name FROM users WHERE phone = $1', [identifier]);
+    const name = (user.rows[0] || {}).name || null;
+    res.json({ name });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 function generateReferralCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -877,6 +893,86 @@ app.post('/payment/verify', async (req, res) => {
       }
     }
     res.json({ success: true, subscribed: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Razorpay: Cancel Recurring Subscription ───────────────────────────────
+// Called from the app's "Cancel Subscription" button. Stops the recurring
+// ₹29/month plan AT RAZORPAY so future auto-charges end — cancelling must
+// never be only a local flag flip, or the customer keeps getting billed.
+//
+// Refund of already-charged months is deliberately NOT here: that is a
+// separate, merchant-initiated action from the Razorpay dashboard (or API)
+// and must never run automatically from a user-facing endpoint.
+app.post('/payment/cancel-subscription', async (req, res) => {
+  try {
+    const { phone, email, subscription_id } = req.body || {};
+    const identifier = phone || email;
+    if (!identifier) return res.status(400).json({ error: 'Phone or email required' });
+    if (!razorpay) {
+      return res.status(500).json({ error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env' });
+    }
+
+    // Resolve the subscription to cancel: the caller-provided id, the id
+    // saved on the user row at activation, or the newest one on record.
+    let subscriptionId = subscription_id;
+    if (!subscriptionId) {
+      const user = await dbq('SELECT subscription_id FROM users WHERE phone = $1', [identifier]);
+      subscriptionId = (user.rows[0] || {}).subscription_id || null;
+    }
+    if (!subscriptionId) {
+      const row = await dbq(
+        `SELECT id FROM subscriptions
+         WHERE phone = $1 AND status IN ('created','authenticated','active','paused','halted')
+         ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+        [identifier]
+      );
+      subscriptionId = (row.rows[0] || {}).id || null;
+    }
+
+    if (!subscriptionId) {
+      // Nothing on record to cancel — the user is already free. Idempotent:
+      // repeat taps / double requests must never error.
+      return res.json({ success: true, cancelled: false, message: 'No active subscription found' });
+    }
+
+    // Stop future charges at Razorpay. If the plan is already in a terminal
+    // state (completed / already cancelled / expired) Razorpay rejects the
+    // cancel — that's fine, nothing left to stop, so we treat it as success
+    // and still sync our own state below (idempotent with the
+    // subscription.cancelled webhook).
+    let cancelledAtRazorpay = false;
+    try {
+      await razorpay.subscriptions.cancel(subscriptionId);
+      cancelledAtRazorpay = true;
+    } catch (e) {
+      const desc = `${(e && (e.error && e.error.description)) || (e && e.message) || ''}`.toLowerCase();
+      const terminal = /already cancelled|already been cancelled|cannot be cancelled|not in (a )?(created|authenticated|active)|completed|expired/i.test(desc);
+      if (!terminal) throw e;
+    }
+
+    // Local deactivation (Postgres + Firestore mirror, best-effort like the
+    // webhook paths). Clearing subscription_id means the next cancel call is
+    // a clean idempotent no-op.
+    await dbq(
+      'UPDATE users SET subscribed = false, subscription_id = NULL WHERE phone = $1',
+      [identifier]
+    );
+    await dbq(
+      'UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2',
+      ['cancelled', subscriptionId]
+    );
+    try {
+      const fUid = await firestore.resolveUid(identifier);
+      if (fUid) {
+        await firestore.set('users/' + fUid, { subscribed: false }, { merge: true });
+        await firestore.set('subscriptions/' + subscriptionId, { uid: fUid, identifier, status: 'cancelled', updatedAt: new Date() }, { merge: true });
+      }
+    } catch (_) {}
+
+    res.json({ success: true, cancelled: true, cancelledAtRazorpay, subscription_id: subscriptionId });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
