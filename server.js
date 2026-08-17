@@ -781,12 +781,27 @@ app.post('/payment/create-subscription', async (req, res) => {
       notes: { phone },
     });
 
-    // Track the subscription → phone mapping so webhooks can find the user.
+    // Track the subscription → user mapping so webhooks can find the user.
+    // Write BOTH Postgres (legacy) and Firestore — the Firestore-only
+    // deployment has no Postgres, and the webhook falls back to Firestore.
     await dbq(
       `INSERT INTO subscriptions (id, phone, status) VALUES ($1, $2, $3)
        ON CONFLICT (id) DO UPDATE SET phone = EXCLUDED.phone, status = EXCLUDED.status`,
       [subscription.id, phone, subscription.status || 'created']
     );
+    try {
+      const fUid = await firestore.resolveUid(phone);
+      await firestore.set(
+        'subscriptions/' + subscription.id,
+        {
+          uid: fUid || null,
+          phone: phone,
+          status: subscription.status || 'created',
+          updatedAt: new Date(),
+        },
+        { merge: true }
+      );
+    } catch (_) {}
 
     res.json({
       subscription_id: subscription.id,
@@ -1024,13 +1039,29 @@ app.post('/payment/webhook', async (req, res) => {
     const subscriptionId = sub?.id || payment?.subscription_id;
     if (!subscriptionId) return res.json({ received: true });
 
-    // Find the phone for this subscription (fall back to payment notes).
+    // Find the phone for this subscription. Try, in order: Postgres (legacy),
+    // payment notes, the subscription entity's own notes, and finally the
+    // Firestore subscriptions/{id} mapping written by create-subscription.
+    // The Firestore-only deployment has no Postgres rows, so the Firestore
+    // mapping (or the subscription's notes) is what actually resolves the
+    // user — without it the webhook would silently do nothing.
     let phone = null;
     try {
       const row = await dbq('SELECT phone FROM subscriptions WHERE id = $1', [subscriptionId]);
       phone = row.rows[0]?.phone || null;
     } catch (_) {}
     if (!phone && payment?.notes?.phone) phone = payment.notes.phone;
+    if (!phone && sub?.notes?.phone) phone = sub.notes.phone;
+    if (!phone) {
+      try {
+        const subDoc = await firestore
+          .getDb()
+          .collection('subscriptions')
+          .doc(subscriptionId)
+          .get();
+        if (subDoc.exists) phone = (subDoc.data() || {}).phone || null;
+      } catch (_) {}
+    }
     if (!phone) return res.json({ received: true });
 
     const eventType = event?.event || '';
