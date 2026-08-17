@@ -55,7 +55,9 @@ const firestoreStub = {
 // ── Razorpay fake ───────────────────────────────────────────────────────
 const razorpayState = {
   lastCreate: null,
+  lastCustomer: null,
   subscriptionsCreate: null,
+  customersCreate: null,
   paymentsFetch: null,
 };
 class RazorpayStub {
@@ -63,6 +65,15 @@ class RazorpayStub {
     this.plans = {
       all: async () => ({ items: [] }),
       create: async () => ({ id: 'plan_test_1' }),
+    };
+    this.customers = {
+      create: async (payload) => {
+        razorpayState.lastCustomer = payload;
+        if (razorpayState.customersCreate) {
+          return razorpayState.customersCreate(payload);
+        }
+        return { id: 'cust_test_1' };
+      },
     };
     this.subscriptions = {
       create: async (payload) => {
@@ -266,19 +277,54 @@ test('webhook: non-state events are logged as ignored', async () => {
 });
 
 // ── create-subscription ─────────────────────────────────────────────────
-test('create-subscription: payload is correct (no customer, no max_retries) and mapping is mirrored', async () => {
+test('create-subscription: attaches a customer (email/phone prefill), no customer block, no max_retries, mapping mirrored', async () => {
   uidMap['+919876543210'] = 'uid_phone';
   const res = makeRes();
-  await createSubscription(makeReq({ phone: '+919876543210' }), res);
+  await createSubscription(makeReq({
+    phone: '+919876543210',
+    name: 'Spandana',
+    email: 'spandana@example.com',
+  }), res);
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.subscription_id, 'sub_test_1');
   assert.equal(res.body.razorpay_key, 'rzp_test_key');
   assert.equal(razorpayState.lastCreate.total_count, 12);
   assert.equal(razorpayState.lastCreate.notes.phone, '+919876543210');
+  // customer created with the user's real identity and attached via customer_id
+  assert.equal(razorpayState.lastCustomer.name, 'Spandana');
+  assert.equal(razorpayState.lastCustomer.email, 'spandana@example.com');
+  assert.equal(razorpayState.lastCustomer.contact, '+919876543210');
+  assert.equal(razorpayState.lastCustomer.fail_existing, 0);
+  assert.equal(razorpayState.lastCreate.customer_id, 'cust_test_1');
   assert.ok(!('customer' in razorpayState.lastCreate), 'customer block must never be sent');
   assert.ok(!('max_retries' in razorpayState.lastCreate), 'max_retries must never be sent');
   const mapping = lastFsSet((s) => s.path === 'subscriptions/sub_test_1');
   assert.equal(mapping.data.phone, '+919876543210');
+});
+
+test('create-subscription: email login → customer has email, no contact (page asks only for mobile)', async () => {
+  const res = makeRes();
+  await createSubscription(makeReq({
+    phone: 'user@example.com',
+    name: 'User',
+    email: 'user@example.com',
+  }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(razorpayState.lastCustomer.email, 'user@example.com');
+  assert.equal(razorpayState.lastCustomer.name, 'User');
+  assert.ok(!('contact' in razorpayState.lastCustomer), 'no contact for an email identifier');
+  assert.equal(razorpayState.lastCreate.customer_id, 'cust_test_1');
+});
+
+test('create-subscription: customer prefill failure never blocks the subscription', async () => {
+  razorpayState.customersCreate = async () => {
+    throw new Error('customer boom');
+  };
+  const res = makeRes();
+  await createSubscription(makeReq({ phone: '+919876543210', email: 'a@b.com' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.subscription_id, 'sub_test_1');
+  assert.ok(!('customer_id' in razorpayState.lastCreate), 'subscription proceeds without a customer');
 });
 
 test('create-subscription: rejects when Razorpay rejects the payload (keeps the error visible)', async () => {

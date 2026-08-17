@@ -771,9 +771,23 @@ app.post('/unsubscribe', async (req, res) => {
 // charges every month) instead of a one-time order. The app opens checkout
 // with the returned subscription_id; Razorpay then charges the customer
 // automatically each billing cycle and fires webhooks we verify below.
+// Turn a user-supplied identifier into a Razorpay contact (+<country><10
+// digits>) when it actually looks like a mobile number. Email logins are
+// common here, so anything that isn't a plain number returns undefined — the
+// hosted page then asks only for the mobile (required for UPI) and prefills
+// the email from the attached customer.
+function normalizeContact(phone) {
+  if (!phone || typeof phone !== 'string') return undefined;
+  const digits = phone.replace(/\D/g, '');
+  if (/^\d{10}$/.test(digits)) return '+91' + digits;
+  if (/^91\d{10}$/.test(digits)) return '+91' + digits.slice(-10);
+  if (/^\+\d{7,15}$/.test(phone)) return phone;
+  return undefined;
+}
+
 app.post('/payment/create-subscription', async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { phone, name, email } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     if (!process.env.RAZORPAY_KEY_ID) {
       return res.status(500).json({ error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env' });
@@ -781,15 +795,39 @@ app.post('/payment/create-subscription', async (req, res) => {
 
     const planId = await getPlanId();
 
+    // Attach a Razorpay customer so the hosted payment page prefills the
+    // user's email (and mobile when we have one) instead of asking for them
+    // — the user already logged in with their email, so it should never be
+    // re-typed. Best-effort: a customer failure never blocks the payment;
+    // without a customer the page simply asks for the details as before.
+    let customerId;
+    try {
+      const customerPayload = {
+        name: (name && name.trim()) || 'MacroSnap User',
+        fail_existing: 0, // reuse the existing customer for repeat subscribers
+      };
+      if (email && email.trim()) customerPayload.email = email.trim();
+      const contact = normalizeContact(phone);
+      if (contact) customerPayload.contact = contact;
+      if (customerPayload.email || customerPayload.contact) {
+        const customer = await razorpay.customers.create(customerPayload);
+        customerId = customer.id;
+      }
+    } catch (e) {
+      console.error('Customer prefill failed (continuing without it):', e.message);
+    }
+
     const subscription = await razorpay.subscriptions.create({
       plan_id: planId,
       total_count: 12, // 12 monthly auto-renewing charges
       customer_notify: 1,
-      // NOTE: do NOT pass a `customer` block here — Razorpay's Subscriptions
-      // API rejects it ("customer is/are not required and should not be
-      // sent"). The customer is created/attached automatically when the user
-      // completes checkout. The phone travels in `notes` so webhooks can
-      // still map the subscription back to the user.
+      ...(customerId ? { customer_id: customerId } : {}),
+      // NOTE: do NOT pass an inline `customer` block here — Razorpay's
+      // Subscriptions API rejects it ("customer is/are not required and
+      // should not be sent"). Attach a pre-created customer via `customer_id`
+      // instead (verified live) so the hosted page prefills the user's
+      // email/contact. The phone travels in `notes` so webhooks can still
+      // map the subscription back to the user.
       notes: { phone },
     });
 
