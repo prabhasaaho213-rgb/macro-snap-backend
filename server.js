@@ -821,7 +821,14 @@ app.post('/payment/verify', async (req, res) => {
     if (!signingId) {
       return res.status(400).json({ error: 'Missing order or subscription id' });
     }
-    const body = `${signingId}|${razorpay_payment_id}`;
+    // NOTE: the signature field order DIFFERS between flows (Razorpay docs +
+    // official SDKs):
+    //   orders:        HMAC(order_id|payment_id)
+    //   subscriptions: HMAC(payment_id|subscription_id)
+    // Getting this backwards makes valid payments fail verification.
+    const body = razorpay_subscription_id
+      ? `${razorpay_payment_id}|${signingId}`
+      : `${signingId}|${razorpay_payment_id}`;
     const expectedSignature = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
       .update(body)
