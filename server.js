@@ -772,6 +772,12 @@ app.post('/payment/create-subscription', async (req, res) => {
     const subscription = await razorpay.subscriptions.create({
       plan_id: planId,
       total_count: 12, // 12 monthly auto-renewing charges
+      // Max leniency on monthly charges: 15 retries (Razorpay max) before a
+      // subscription is halted, so a single failed month (expired card, low
+      // balance) has many chances before Pro drops. Pro is never cancelled
+      // from the app — the subscription ends only when Razorpay itself halts
+      // it after exhausted retries or the 12 charges complete.
+      max_retries: 15,
       customer_notify: 1,
       // NOTE: do NOT pass a `customer` block here — Razorpay's Subscriptions
       // API rejects it ("customer is/are not required and should not be
