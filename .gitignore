@@ -5,3 +5,5 @@ test_*.js
 *.png
 *.jpeg
 .vercel
+clear_backup_data.py
+cloud_backup_*.json

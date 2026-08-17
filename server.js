@@ -761,7 +761,7 @@ app.post('/unsubscribe', async (req, res) => {
 // automatically each billing cycle and fires webhooks we verify below.
 app.post('/payment/create-subscription', async (req, res) => {
   try {
-    const { phone, name, email } = req.body;
+    const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     if (!process.env.RAZORPAY_KEY_ID) {
       return res.status(500).json({ error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env' });
@@ -773,12 +773,12 @@ app.post('/payment/create-subscription', async (req, res) => {
       plan_id: planId,
       total_count: 12, // 12 monthly charges; user can cancel anytime
       customer_notify: 1,
+      // NOTE: do NOT pass a `customer` block here — Razorpay's Subscriptions
+      // API rejects it ("customer is/are not required and should not be
+      // sent"). The customer is created/attached automatically when the user
+      // completes checkout. The phone travels in `notes` so webhooks can
+      // still map the subscription back to the user.
       notes: { phone },
-      customer: {
-        name: name || 'MacroSnap User',
-        contact: phone,
-        email: email || undefined,
-      },
     });
 
     // Track the subscription → phone mapping so webhooks can find the user.
