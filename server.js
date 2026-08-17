@@ -413,7 +413,11 @@ app.post('/register', async (req, res) => {
     }
     const user = await dbq('SELECT * FROM users WHERE phone = $1', [identifier]);
     const row = user.rows[0] || {};
-    // Firestore mirror: user doc + identifier index (best-effort).
+    // Firestore mirror: user doc + identifier index (best-effort). NOTE: the
+    // mirror never writes `subscribed` — registration must not touch an
+    // existing user's paid state, and on the DB-less deployment the Postgres
+    // row is empty so `row.subscribed` would be undefined (which the Admin
+    // SDK rejects as an invalid field value).
     {
       const fUid = await firestore.resolveUid(identifier);
       if (fUid) {
@@ -421,7 +425,6 @@ app.post('/register', async (req, res) => {
           identifier: identifier,
           email: email || null,
           name: name || '',
-          subscribed: row.subscribed,
         }, { merge: true });
         await firestore.set('userIndex/' + identifier, { uid: fUid, name: name || '' }, { merge: true });
       }
@@ -440,8 +443,23 @@ app.get('/user/profile', async (req, res) => {
     const { phone, email } = req.query;
     const identifier = phone || email;
     if (!identifier) return res.status(400).json({ error: 'Phone or email required' });
-    const user = await dbq('SELECT name FROM users WHERE phone = $1', [identifier]);
-    const name = (user.rows[0] || {}).name || null;
+    // Firestore first (the DB-less deployment's source of truth): the
+    // /register mirror writes userIndex/{identifier}.name so a nickname is
+    // never lost after reinstall. Falls back to Postgres when absent.
+    let name = null;
+    try {
+      const fUid = await firestore.resolveUid(identifier);
+      if (fUid && firestore.isEnabled()) {
+        const idx = await firestore.getDb().collection('userIndex').doc(identifier).get();
+        if (idx.exists && typeof idx.data().name === 'string') {
+          name = idx.data().name;
+        }
+      }
+    } catch (_) {}
+    if (name === null) {
+      const user = await dbq('SELECT name FROM users WHERE phone = $1', [identifier]);
+      name = (user.rows[0] || {}).name || null;
+    }
     res.json({ name });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -455,30 +473,43 @@ function generateReferralCode() {
   return code;
 }
 
+// Referral code helper: Firestore-first (DB-less deployment), then Postgres,
+// then generate — so the same code is always returned for the same user and
+// the Firestore-only production never regenerates codes on every call.
+async function getOrCreateReferralCode(identifier) {
+  try {
+    const fUid = await firestore.resolveUid(identifier);
+    if (fUid && firestore.isEnabled()) {
+      const doc = await firestore.getDb().collection('users').doc(fUid).get();
+      if (doc.exists && doc.data().referralCode) return doc.data().referralCode;
+    }
+  } catch (_) {}
+  try {
+    const existing = await dbq('SELECT referral_code FROM users WHERE phone = $1', [identifier]);
+    if (existing.rows[0]?.referral_code) return existing.rows[0].referral_code;
+  } catch (_) {}
+  let code;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    code = generateReferralCode();
+    const dup = await dbq('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+    if (dup.rows.length === 0) break;
+  }
+  await dbq('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, identifier]);
+  try {
+    const fUid = await firestore.resolveUid(identifier);
+    if (fUid) {
+      await firestore.set('users/' + fUid, { referralCode: code }, { merge: true });
+      await firestore.set('referrals/' + code, { uid: fUid, identifier, createdAt: new Date() }, { merge: true });
+    }
+  } catch (_) {}
+  return code;
+}
+
 app.post('/referral/generate', async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
-    const existing = await dbq('SELECT referral_code FROM users WHERE phone = $1', [phone]);
-    if (existing.rows[0]?.referral_code) {
-      return res.json({ referral_code: existing.rows[0].referral_code });
-    }
-    let code;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      code = generateReferralCode();
-      const dup = await dbq('SELECT 1 FROM users WHERE referral_code = $1', [code]);
-      if (dup.rows.length === 0) break;
-    }
-    await dbq('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
-    // Firestore mirror: referral code on the user + referrals index.
-    {
-      const fUid = await firestore.resolveUid(phone);
-      if (fUid) {
-        await firestore.set('users/' + fUid, { referralCode: code }, { merge: true });
-        await firestore.set('referrals/' + code, { uid: fUid, identifier: phone, createdAt: new Date() }, { merge: true });
-      }
-    }
-    res.json({ referral_code: code });
+    res.json({ referral_code: await getOrCreateReferralCode(phone) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -487,27 +518,8 @@ app.post('/referral/generate', async (req, res) => {
 app.get('/referral/my-code/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
-    let code = null;
-    let result = await dbq('SELECT referral_code FROM users WHERE phone = $1', [phone]);
-    if (!result.rows[0]?.referral_code) {
-      for (let attempt = 0; attempt < 10; attempt++) {
-        code = generateReferralCode();
-        const dup = await dbq('SELECT 1 FROM users WHERE referral_code = $1', [code]);
-        if (dup.rows.length === 0) break;
-      }
-      await dbq('UPDATE users SET referral_code = $1 WHERE phone = $2', [code, phone]);
-    } else {
-      code = result.rows[0].referral_code;
-    }
-    // Firestore mirror (best-effort) — also the DB-less source of truth.
-    {
-      const fUid = await firestore.resolveUid(phone);
-      if (fUid && code) {
-        await firestore.set('users/' + fUid, { referralCode: code }, { merge: true });
-        await firestore.set('referrals/' + code, { uid: fUid, identifier: phone, createdAt: new Date() }, { merge: true });
-      }
-    }
-    res.json({ referral_code: code });
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    res.json({ referral_code: await getOrCreateReferralCode(phone) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -957,7 +969,21 @@ app.post('/payment/webhook', async (req, res) => {
     const sub = event?.payload?.subscription?.entity;
     const payment = event?.payload?.payment?.entity;
     const subscriptionId = sub?.id || payment?.subscription_id;
-    if (!subscriptionId) return res.json({ received: true });
+    // Every processed event is recorded in webhookLog/{id} — a payment that
+    // never activates (or an event we can't map to a user) is visible within
+    // minutes instead of silently returning { received: true }.
+    const logEventId =
+      event?.id || ('evt_' + (event?.created_at || Date.now()) + '_' + (subscriptionId || 'none'));
+    if (!subscriptionId) {
+      try {
+        await firestore.set('webhookLog/' + logEventId, {
+          event: event?.event || '',
+          outcome: 'no_subscription',
+          receivedAt: new Date(),
+        }, { merge: true });
+      } catch (_) {}
+      return res.json({ received: true });
+    }
 
     // Find the phone for this subscription. Try, in order: Postgres (legacy),
     // payment notes, the subscription entity's own notes, and finally the
@@ -982,8 +1008,6 @@ app.post('/payment/webhook', async (req, res) => {
         if (subDoc.exists) phone = (subDoc.data() || {}).phone || null;
       } catch (_) {}
     }
-    if (!phone) return res.json({ received: true });
-
     const eventType = event?.event || '';
     // Activate on first charge + each monthly auto-charge. NOTE: Razorpay
     // subscriptions have a max of 12 charges, then subscription.completed
@@ -1000,7 +1024,10 @@ app.post('/payment/webhook', async (req, res) => {
       eventType.includes('halted') ||
       eventType.includes('failed');
 
-    if (turnOn) {
+    let outcome;
+    if (!phone) {
+      outcome = 'unresolved';
+    } else if (turnOn) {
       await dbq(
         'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true, subscription_id = $2',
         [phone, subscriptionId]
@@ -1018,6 +1045,7 @@ app.post('/payment/webhook', async (req, res) => {
           await firestore.set('subscriptions/' + subscriptionId, { uid: fUid || null, identifier: phone, status: sub?.status || 'active', updatedAt: new Date() }, { merge: true });
         }
       }
+      outcome = 'activated';
     } else if (turnOff) {
       await dbq('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
       try {
@@ -1033,7 +1061,24 @@ app.post('/payment/webhook', async (req, res) => {
           await firestore.set('subscriptions/' + subscriptionId, { status: sub?.status || 'cancelled', updatedAt: new Date() }, { merge: true });
         }
       }
+      outcome = 'deactivated';
+    } else {
+      // Known event but no state change required (e.g. subscription.created).
+      outcome = 'ignored';
     }
+
+    try {
+      const fUid = phone ? await firestore.resolveUid(phone) : null;
+      await firestore.set('webhookLog/' + logEventId, {
+        event: eventType,
+        subscriptionId,
+        phone: phone || null,
+        uid: fUid || null,
+        outcome,
+        status: sub?.status || null,
+        receivedAt: new Date(),
+      }, { merge: true });
+    } catch (_) {}
 
     res.json({ received: true });
   } catch (e) {
@@ -1046,15 +1091,46 @@ app.post('/payment/webhook', async (req, res) => {
 app.get('/payment/status/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
-    const user = await dbq('SELECT subscribed FROM users WHERE phone = $1', [phone]);
-    const payments = await dbq(
-      'SELECT * FROM payments WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
-      [phone]
-    );
-    res.json({
-      subscribed: user.rows[0]?.subscribed || false,
-      payment: payments.rows[0] || null
-    });
+    // Firestore first (DB-less deployment's source of truth), Postgres
+    // fallback — same pattern as /subscription/status.
+    let subscribed = false;
+    let payment = null;
+    try {
+      const fUid = await firestore.resolveUid(phone);
+      if (fUid && firestore.isEnabled()) {
+        const doc = await firestore.getDb().collection('users').doc(fUid).get();
+        if (doc.exists) subscribed = doc.data().subscribed === true;
+        const snap = await firestore
+          .getDb()
+          .collection('payments')
+          .where('identifier', '==', phone)
+          .get();
+        let newest = null;
+        (snap.docs || []).forEach((d) => {
+          const data = d.data();
+          const t = data.createdAt ? new Date(data.createdAt).getTime() : 0;
+          if (!newest || t > newest._t) newest = { ...data, _t: t };
+        });
+        if (newest) {
+          payment = {
+            transactionRef: newest.transactionRef || null,
+            amount: newest.amount || null,
+            status: newest.status || null,
+            createdAt: newest.createdAt ? new Date(newest.createdAt).toISOString() : null,
+          };
+        }
+      }
+    } catch (_) {}
+    if (!subscribed && !payment) {
+      const user = await dbq('SELECT subscribed FROM users WHERE phone = $1', [phone]);
+      const payments = await dbq(
+        'SELECT * FROM payments WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
+        [phone]
+      );
+      subscribed = user.rows[0]?.subscribed || false;
+      payment = payments.rows[0] || null;
+    }
+    res.json({ subscribed, payment });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
