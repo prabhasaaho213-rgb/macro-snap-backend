@@ -195,6 +195,69 @@ function isAdminUser(identifier) {
     identifier.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase();
 }
 
+// ── 30-day free trial ────────────────────────────────────────────────────
+// Every user — new signups and existing users after they update + log in —
+// gets ONE 30-day free Pro plan. The grant is one-time: trial_started_at is
+// written only when absent and is never reset, so the trial can only ever be
+// claimed once per account. Firestore users/{uid}.trial_started_at is the
+// source of truth; Postgres is a best-effort fallback for legacy
+// deployments (the column may not exist there, which we swallow).
+const TRIAL_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function trialState(startedAt, now = Date.now()) {
+  if (!startedAt) return { active: false, expired: false, daysLeft: 0 };
+  const started = new Date(startedAt).getTime();
+  if (Number.isNaN(started)) return { active: false, expired: false, daysLeft: 0 };
+  const ends = started + TRIAL_DAYS * DAY_MS;
+  const endsAt = new Date(ends).toISOString();
+  if (now >= ends) return { active: false, expired: true, daysLeft: 0, endsAt };
+  return {
+    active: true,
+    expired: false,
+    daysLeft: Math.max(1, Math.ceil((ends - now) / DAY_MS)),
+    endsAt,
+  };
+}
+
+// Reads the trial start for an identifier, granting the one-time trial when
+// no record exists yet. Returns the ISO start or null when nothing can be
+// stored (no Firestore doc and no DB) — the caller then reports no trial.
+async function getOrGrantTrial(identifier) {
+  const fUid = await firestore.resolveUid(identifier);
+  if (fUid && firestore.isEnabled()) {
+    try {
+      const ref = firestore.getDb().collection('users').doc(fUid);
+      const doc = await ref.get();
+      const existing = doc.exists ? doc.data().trial_started_at : null;
+      if (existing) return existing;
+      const nowIso = new Date().toISOString();
+      await firestore.set('users/' + fUid, { trial_started_at: nowIso }, { merge: true });
+      return nowIso;
+    } catch (_) {}
+  }
+  try {
+    const r = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
+    const existing = r.rows[0] && r.rows[0].trial_started_at;
+    if (existing) return existing;
+    const nowIso = new Date().toISOString();
+    await dbq('UPDATE users SET trial_started_at = $2 WHERE phone = $1 OR email = $1', [identifier, nowIso]);
+    return nowIso;
+  } catch (_) {
+    return null; // DB-less legacy deployment without Firestore — no trial.
+  }
+}
+
+// Postgres-only trial lookup (never grants). Swallows a missing column.
+async function pgTrial(identifier) {
+  try {
+    const r = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
+    return trialState(r.rows[0] && r.rows[0].trial_started_at);
+  } catch (_) {
+    return { active: false, expired: false, daysLeft: 0 };
+  }
+}
+
 app.post('/analyze', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
@@ -208,6 +271,7 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
       let subscribed = isAdminUser(phone);
       let count = 0;
       let scanMonth = 0;
+      let fsTrial = null; // Firestore trial_started_at on the DB-less path
       if (dbAvailable) {
         // Postgres path (source of truth when a DB is configured).
         const user = await dbq('SELECT subscribed, scan_count, scan_month FROM users WHERE phone = $1', [phone]);
@@ -223,7 +287,12 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
         const d = doc.exists ? doc.data() : {};
         count = d.scanCount || 0;
         scanMonth = d.scanMonth || 0;
+        fsTrial = d.trial_started_at || null;
       }
+      // A user inside the 30-day free trial has Pro perks — the free scan
+      // cap must not apply to them.
+      if (!subscribed && !dbAvailable) subscribed = trialState(fsTrial).active;
+      if (!subscribed && dbAvailable) subscribed = (await pgTrial(phone)).active;
       // The owner is ALWAYS subscribed — the DB lookup above must never
       // downgrade them. Without this, an admin whose stored row/doc says
       // subscribed=false (e.g. never paid via Razorpay) gets 403'd at the
@@ -1219,6 +1288,68 @@ app.get('/payment/status/:phone', async (req, res) => {
 });
 
 // --- Subscription verification (Firestore first, Postgres fallback) ------
+// Grants or reports the one-time 30-day free plan. Called by the app at
+// startup and after login — that is also what hands existing users their
+// trial after an app update.
+app.get('/trial/status', async (req, res) => {
+  try {
+    const { phone, email } = req.query;
+    const identifier = phone || email;
+    if (!identifier) return res.status(400).json({ error: 'Phone or email required' });
+    if (isAdminUser(identifier)) return res.json({ admin: true, active: false, daysLeft: 0 });
+    const startedAt = await getOrGrantTrial(identifier);
+    if (!startedAt) return res.json({ active: false, expired: false, daysLeft: 0 });
+    res.json(trialState(startedAt));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// In-app nutrition chatbot. Answers ONLY food/nutrition/protein questions —
+// the system instruction makes Gemini refuse everything else, which the
+// backend tests lock in.
+const CHAT_SYSTEM_PROMPT =
+  'You are MacroSnap\u2019s in-app nutrition assistant inside a calorie-tracking app. ' +
+  'Answer ONLY questions about food, nutrition and protein: calories, macros (protein, carbs, fat), ' +
+  'vitamins, minerals, hydration, ingredients, recipes, Indian and global dishes, veg and non-veg meal ideas, ' +
+  'meal planning, portion sizes, and food-related fitness nutrition. ' +
+  'If (and only if) the question is NOT about food, nutrition or protein, reply exactly once with: ' +
+  '\u201CI can only help with food, nutrition and protein questions \u2014 ask me anything about what to eat!\u201D ' +
+  'and suggest one example of a food question. Never answer unrelated topics (code, news, politics, personal advice, medical diagnoses). ' +
+  'Keep answers under 120 words, friendly and practical. When you name a traditional Indian dish, add a short English explanation in parentheses.';
+
+app.post('/chat', async (req, res) => {
+  try {
+    const { message, history } = req.body || {};
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: 'message required' });
+    }
+    const userMsg = message.trim().slice(0, 2000);
+    const turns = (Array.isArray(history) ? history : [])
+      .slice(-10)
+      .filter((t) => t && (t.role === 'user' || t.role === 'model') && typeof t.text === 'string')
+      .map((t) => ({ role: t.role, parts: [{ text: String(t.text).slice(0, 500) }] }));
+    turns.push({ role: 'user', parts: [{ text: userMsg }] });
+
+    const key = process.env.GEMINI_KEY;
+    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
+        contents: turns,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (!text) throw new Error('Empty response from AI');
+    res.json({ reply: text.slice(0, 2000) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/subscription/status', async (req, res) => {
   try {
     const { phone, email } = req.query;
@@ -1236,6 +1367,11 @@ app.get('/subscription/status', async (req, res) => {
         if (doc.exists && doc.data().subscribed === true) {
           return res.json({ subscribed: true });
         }
+        // An active 30-day free trial counts as Pro until it expires.
+        if (doc.exists) {
+          const ts = trialState(doc.data().trial_started_at);
+          if (ts.active) return res.json({ subscribed: true, trial_days_left: ts.daysLeft, trial_ends_at: ts.endsAt });
+        }
       } catch (_) {}
     }
 
@@ -1249,7 +1385,10 @@ app.get('/subscription/status', async (req, res) => {
       const r = await dbq('SELECT subscribed FROM users WHERE email = $1 LIMIT 1', [email]);
       user = r.rows[0] || null;
     }
-    res.json({ subscribed: user?.subscribed || false });
+    if (user?.subscribed) return res.json({ subscribed: true });
+    const ts = await pgTrial(identifier);
+    if (ts.active) return res.json({ subscribed: true, trial_days_left: ts.daysLeft, trial_ends_at: ts.endsAt });
+    res.json({ subscribed: false });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
