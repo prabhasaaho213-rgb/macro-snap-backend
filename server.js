@@ -345,9 +345,18 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
   }
 });
 
+// Keyword scan used to verify /generate-diet-plan output. Kept broad on
+// purpose: a false positive costs one retry, a false negative serves meat to
+// a vegetarian user.
+const NON_VEG_RE = /\b(chicken|mutton|fish|prawn|shrimp|crab|lobster|lamb|beef|pork|bacon|sausage|keema|egg|omlet|omelette|salmon|tuna|meat)\b/i;
+const planText = (plan) => [
+  ...((plan && plan.meals) || []).map((m) => `${m.name || ''} ${m.description || ''}`),
+  ...((plan && plan.tips) || []).map(String),
+].join('\n');
+
 app.post('/generate-diet-plan', async (req, res) => {
   try {
-    const { weight, height, age, gender, goal, activity } = req.body;
+    const { weight, height, age, gender, goal, activity, diet } = req.body;
     if (!weight || !height || !age) return res.status(400).json({ error: 'Weight, height & age required' });
 
     const bmr = gender === 'male' ? 10 * weight + 6.25 * height - 5 * age + 5 : 10 * weight + 6.25 * height - 5 * age - 161;
@@ -359,9 +368,18 @@ app.post('/generate-diet-plan', async (req, res) => {
     const fatTarget = calTarget * 0.25 / 9;
     const carbTarget = (calTarget - (proteinTarget * 4) - (fatTarget * 9)) / 4;
 
+    // Diet preference: the app sends DietPreference.name — 'vegetarian' or
+    // 'nonVegetarian'. Absent/unknown values fall back to vegetarian: offering
+    // meat to someone who never opted in is the worse failure mode.
+    const wantsVeg = !String(diet ?? 'vegetarian').toLowerCase().includes('non');
+    const dietLine = wantsVeg
+      ? 'Diet: STRICTLY VEGETARIAN (lacto-vegetarian). No chicken, mutton, fish, prawns, other seafood, eggs or any animal flesh in ANY meal, snack or tip. Dairy is allowed (paneer, curd, milk, ghee, lassi, chaas). Never suggest swapping in meat or eggs.'
+      : 'Diet: NON-VEGETARIAN. Chicken, fish, eggs and other meat are allowed.';
+
     const prompt = `You are an Indian nutritionist. Generate a personalized ONE-DAY Indian diet plan.
 User: ${gender}, ${age} yrs, ${weight}kg, ${height}cm, BMI ${bmi.toFixed(1)}.
 Goal: ${goal}, Activity: ${activity}.
+${dietLine}
 TDEE: ${Math.round(tdee)} kcal, Target: ${Math.round(calTarget)} kcal/day.
 Macros: Protein ${proteinTarget.toFixed(0)}g, Carbs ${carbTarget.toFixed(0)}g, Fats ${fatTarget.toFixed(0)}g.
 
@@ -376,21 +394,38 @@ Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
   "tips": ["tip1", "tip2", "tip3"]
 }`;
 
-    const key = process.env.GEMINI_KEY;
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-    });
+    const callGemini = async (p) => {
+      const key = process.env.GEMINI_KEY;
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: p }] }] })
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+      if (!text) throw new Error('Empty response from AI');
+      const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
+      return JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
+    };
 
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+    let plan = await callGemini(prompt);
 
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (!text) throw new Error('Empty response from AI');
-
-    const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
-    const plan = JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
+    // An instruction alone is not a guarantee — verify the returned plan and
+    // retry once with the offending items called out. If the retry still
+    // violates the diet, fail loudly rather than serve meat to a vegetarian.
+    if (wantsVeg && NON_VEG_RE.test(planText(plan))) {
+      const offender = NON_VEG_RE.exec(planText(plan))[0];
+      const retry = await callGemini(
+        `${prompt}\n\nYour previous plan was rejected: it contained non-vegetarian items ` +
+        `("${offender}"). Regenerate the same one-day plan but strictly ` +
+        'vegetarian — no meat, fish, poultry, eggs or seafood in any meal, snack or tip.'
+      );
+      if (NON_VEG_RE.test(planText(retry))) {
+        throw new Error('The AI could not produce a vegetarian plan. Please try again.');
+      }
+      plan = retry;
+    }
 
     res.json({ bmi: bmi.toFixed(1), bmr: Math.round(bmr), tdee: Math.round(tdee), targetCalories: Math.round(calTarget), targetProtein: proteinTarget.toFixed(0), targetCarbs: carbTarget.toFixed(0), targetFats: fatTarget.toFixed(0), plan });
   } catch (e) {
