@@ -376,10 +376,19 @@ app.post('/generate-diet-plan', async (req, res) => {
       ? 'Diet: STRICTLY VEGETARIAN (lacto-vegetarian). No chicken, mutton, fish, prawns, other seafood, eggs or any animal flesh in ANY meal, snack or tip. Dairy is allowed (paneer, curd, milk, ghee, lassi, chaas). Never suggest swapping in meat or eggs.'
       : 'Diet: NON-VEGETARIAN. Chicken, fish, eggs and other meat are allowed.';
 
+    // The app is used by a global audience — every traditional Indian dish
+    // name must carry an inline plain-English gloss so nobody has to guess
+    // what "dal tadka" or "khichdi" is.
+    const languageLine =
+      'Language: use simple English that anyone worldwide understands. ' +
+      'When you name a traditional Indian food or dish (for example dal tadka, roti, idli, sabzi, khichdi, rasam, curd, paneer, lassi), immediately follow its name with a short plain-English explanation in parentheses — e.g. "dal tadka (spiced yellow lentil stew)", "roti (whole-wheat flatbread)", "curd (yogurt)". ' +
+      'Never leave a regional or Hindi word unexplained, and put the explanation right after the term — not at the end of the sentence.';
+
     const prompt = `You are an Indian nutritionist. Generate a personalized ONE-DAY Indian diet plan.
 User: ${gender}, ${age} yrs, ${weight}kg, ${height}cm, BMI ${bmi.toFixed(1)}.
 Goal: ${goal}, Activity: ${activity}.
 ${dietLine}
+${languageLine}
 TDEE: ${Math.round(tdee)} kcal, Target: ${Math.round(calTarget)} kcal/day.
 Macros: Protein ${proteinTarget.toFixed(0)}g, Carbs ${carbTarget.toFixed(0)}g, Fats ${fatTarget.toFixed(0)}g.
 

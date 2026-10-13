@@ -142,4 +142,14 @@ test('a missing diet field is treated as vegetarian (safe default)', async () =>
   assert.match(gemini.prompts[0], /STRICTLY VEGETARIAN/);
 });
 
+test('prompt demands inline plain-English glosses for Indian dish names', async () => {
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(makeReq({ weight: 70, height: 170, age: 25, gender: 'female', goal: 'loseWeight', activity: 'light', diet: 'vegetarian' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.match(gemini.prompts[0], /simple English/);
+  assert.match(gemini.prompts[0], /plain-English explanation in parentheses/);
+  assert.match(gemini.prompts[0], /right after the term/);
+});
+
 test('restored after tests', () => { global.fetch = origFetch; });
