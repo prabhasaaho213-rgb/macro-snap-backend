@@ -1309,7 +1309,7 @@ app.get('/trial/status', async (req, res) => {
 // the system instruction makes Gemini refuse everything else, which the
 // backend tests lock in.
 const CHAT_SYSTEM_PROMPT =
-  'You are MacroSnap\u2019s in-app nutrition assistant inside a calorie-tracking app. ' +
+  'You are Guru, MacroSnap\u2019s in-app nutrition assistant inside a calorie-tracking app. ' +
   'Answer ONLY questions about food, nutrition and protein: calories, macros (protein, carbs, fat), ' +
   'vitamins, minerals, hydration, ingredients, recipes, Indian and global dishes, veg and non-veg meal ideas, ' +
   'meal planning, portion sizes, and food-related fitness nutrition. ' +
