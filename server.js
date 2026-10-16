@@ -296,6 +296,9 @@ async function initDB(retries = 5) {
         // /trial/status re-issued an UNPERSISTED fresh 30-day window on each
         // check. Adding it makes the one-time grant actually persist.
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ"); } catch (_) {}
+        // pro_until: a 30-day Pro window (referral reward). A paid subscription
+        // sets `subscribed`; a referral only ever sets a date.
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_until TIMESTAMPTZ"); } catch (_) {}
         try { await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_code ON users (referral_code)"); } catch (_) {}
         await client.query(`
           CREATE TABLE IF NOT EXISTS payments (
@@ -386,6 +389,15 @@ function isAdminUser(identifier, emailVerified) {
 // deployments (the column may not exist there, which we swallow).
 const TRIAL_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+// A referral grants a 30-DAY Pro WINDOW (`pro_until`), not a permanent
+// `subscribed` flag — an expired referral therefore drops the user back to
+// free instead of giving away Pro forever. True for a parseable future date.
+function proUntilActive(iso) {
+  if (!iso) return false;
+  const t = Date.parse(typeof iso === 'string' ? iso : String(iso));
+  return Number.isFinite(t) && t > Date.now();
+}
 
 function trialState(startedAt, now = Date.now()) {
   if (!startedAt) return { active: false, expired: false, daysLeft: 0 };
@@ -532,6 +544,8 @@ async function entitlementsFor({ uid, identifier, emailVerified }) {
       const doc = await firestore.getDb().collection('users').doc(uid).get();
       const d = (doc.exists ? doc.data() : {}) || {};
       if (d.subscribed === true) subscribed = true;
+      // A referral's 30-day window counts as Pro until it passes.
+      if (!subscribed && proUntilActive(d.pro_until)) subscribed = true;
       const ts = trialState(d.trial_started_at);
       if (ts.active) {
         subscribed = true;
@@ -546,11 +560,12 @@ async function entitlementsFor({ uid, identifier, emailVerified }) {
   if (dbAvailable && identifier) {
     if (!subscribed) {
       const u = await dbq(
-        'SELECT subscribed, trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1',
+        'SELECT subscribed, trial_started_at, pro_until FROM users WHERE phone = $1 OR email = $1 LIMIT 1',
         [identifier]
       );
       const row = u.rows[0];
       if (row && row.subscribed) subscribed = true;
+      if (!subscribed && proUntilActive(row && row.pro_until)) subscribed = true;
       const ts = trialState(row && row.trial_started_at);
       if (ts.active) {
         subscribed = true;
@@ -1093,52 +1108,134 @@ app.get('/me/referral-code', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Referral reward ───────────────────────────────────────────────────────
+// A referral buys BOTH accounts 30 days of Pro — which is what the app has
+// always told the user ("both get Pro free for a month", ReferralService
+// returns 'free_month'). The old version wrote `subscribed: true` with NO end
+// date, so one code made two accounts Pro forever.
+//
+// It had two more holes:
+//   - The "already used a code" guard read only Postgres. Production runs
+//     Firestore-only, so that query always came back empty and the guard never
+//     fired — a code could be applied again and again, and the referrer earned
+//     permanent Pro each time.
+//   - Self-referral was only blocked by comparing the referrer's PHONE, which
+//     is NULL on the Firestore-only path, against a non-null identifier — so
+//     the check could never succeed there.
+//
+// Now the Firestore transaction is the authority: it checks "already used"
+// and grants the window in one atomic step, and self-referral is blocked by
+// UID as well as by identifier.
+const REFERRAL_PRO_DAYS = 30;
+
+// Later of two Pro end dates — extending a Pro window must never shorten one
+// the user already has (paid, trial, or an earlier referral).
+function laterOfProUntil(a, b) {
+  const ta = Date.parse(a || '') || 0;
+  const tb = Date.parse(b || '') || 0;
+  return new Date(Math.max(ta, tb)).toISOString();
+}
+
 app.post('/referral/apply', requireAuth, async (req, res) => {
   try {
     const { code } = req.body;
+    const id = identityOf(req);
     // The reward is applied to the signed-in account, never to a phone/email
     // the client claims.
-    const phone = identityOf(req).identifier;
-    if (!phone || !code) return res.status(400).json({ error: 'Phone and code required' });
-    const upper = code.toUpperCase();
+    const phone = id.identifier;
+    const upper = typeof code === 'string' ? code.trim().toUpperCase() : '';
+    if (!phone || !upper) return res.status(400).json({ error: 'Phone and code required' });
+
     let referrerPhone = null;
     let referrerUid = null;
 
-    // Postgres lookup first (legacy), then the Firestore referrals index.
-    const referrer = await dbq('SELECT phone FROM users WHERE referral_code = $1', [upper]);
-    if (referrer.rows[0]?.phone) {
-      referrerPhone = referrer.rows[0].phone;
-      referrerUid = await firestore.resolveUid(referrerPhone);
-    } else if (firestore.isEnabled()) {
+    // The Firestore referrals index is the live path; Postgres is legacy.
+    if (firestore.isEnabled()) {
       try {
         const refDoc = await firestore.getDb().collection('referrals').doc(upper).get();
-        if (refDoc.exists) {
-          referrerUid = refDoc.data().uid || null;
-        }
+        if (refDoc.exists) referrerUid = refDoc.data().uid || null;
       } catch (_) {}
     }
+    if (!referrerUid) {
+      const referrer = await dbq('SELECT phone FROM users WHERE referral_code = $1', [upper]);
+      if (referrer.rows[0]?.phone) {
+        referrerPhone = referrer.rows[0].phone;
+        referrerUid = await firestore.resolveUid(referrerPhone);
+      }
+    }
     if (!referrerPhone && !referrerUid) return res.status(404).json({ error: 'Invalid referral code' });
-    if (referrerPhone === phone) return res.status(400).json({ error: 'Cannot use your own code' });
 
-    const newUser = await dbq('SELECT referred_by FROM users WHERE phone = $1', [phone]);
-    if (newUser.rows[0]?.referred_by) return res.status(400).json({ error: 'Already used a referral code' });
-    await dbq('UPDATE users SET referred_by = $1, subscribed = true WHERE phone = $2', [upper, phone]);
-    if (referrerPhone) {
-      await dbq('UPDATE users SET subscribed = true WHERE phone = $1', [referrerPhone]);
+    // Self-referral: blocked by UID (authoritative on Firestore) as well as by
+    // identifier, so the Firestore-only path can no longer slip through.
+    if ((referrerUid && id.uid && referrerUid === id.uid) ||
+        (referrerPhone && referrerPhone === phone)) {
+      return res.status(400).json({ error: 'Cannot use your own code' });
     }
 
-    // Firestore mirror: grant both users Pro + mark referredBy (best-effort,
-    // and the only path when Postgres is absent).
-    {
-      const fUid = await firestore.resolveUid(phone);
-      if (fUid) {
-        await firestore.set('users/' + fUid, { subscribed: true, referredBy: upper }, { merge: true });
-      }
-      if (referrerUid) {
-        await firestore.set('users/' + referrerUid, { subscribed: true }, { merge: true });
+    const proUntil = new Date(Date.now() + REFERRAL_PRO_DAYS * 24 * 60 * 60 * 1000).toISOString();
+
+    // Legacy deployments: this check has to happen BEFORE the Firestore grant,
+    // not after, or a Postgres-only user could be granted and then rejected.
+    if (dbAvailable && phone) {
+      const newUser = await dbq('SELECT referred_by FROM users WHERE phone = $1', [phone]);
+      if (newUser.rows[0]?.referred_by) {
+        return res.status(400).json({ error: 'Already used a referral code' });
       }
     }
-    res.json({ subscribed: true, referrer: referrerPhone || 'referred' });
+
+    // Firestore is authoritative. ONE transaction does the check and the
+    // grant, so the guard cannot be skipped when Postgres is absent, and two
+    // concurrent submissions cannot both win. A transaction failure fails
+    // closed: no reward is granted.
+    if (firestore.isEnabled() && id.uid) {
+      const db = firestore.getDb();
+      let alreadyUsed = false;
+      await db.runTransaction(async (tx) => {
+        const myRef = db.collection('users').doc(id.uid);
+        const myDoc = await tx.get(myRef);
+        const mine = (myDoc.exists ? myDoc.data() : {}) || {};
+        if (mine.referredBy || mine.referred_by) {
+          alreadyUsed = true;
+          return;
+        }
+        tx.set(myRef, {
+          referredBy: upper,
+          pro_until: laterOfProUntil(mine.pro_until, proUntil),
+        }, { merge: true });
+
+        // The referrer is rewarded only once the invitee has actually
+        // redeemed, so a code cannot be farmed from a second account.
+        if (referrerUid) {
+          const theirRef = db.collection('users').doc(referrerUid);
+          const theirDoc = await tx.get(theirRef);
+          const theirs = (theirDoc.exists ? theirDoc.data() : {}) || {};
+          tx.set(theirRef, { pro_until: laterOfProUntil(theirs.pro_until, proUntil) }, { merge: true });
+        }
+      });
+      if (alreadyUsed) return res.status(400).json({ error: 'Already used a referral code' });
+    }
+
+    // Legacy Postgres mirror. It records the referral and the WINDOW — never a
+    // permanent `subscribed = true`, which is the bug being fixed here.
+    if (dbAvailable && phone) {
+      await dbq('UPDATE users SET referred_by = $1 WHERE phone = $2', [upper, phone]);
+      await dbq(
+        'UPDATE users SET pro_until = GREATEST(COALESCE(pro_until, NOW()), $1::timestamptz) WHERE phone = $2',
+        [proUntil, phone]
+      );
+      if (referrerPhone) {
+        await dbq(
+          'UPDATE users SET pro_until = GREATEST(COALESCE(pro_until, NOW()), $1::timestamptz) WHERE phone = $2',
+          [proUntil, referrerPhone]
+        );
+      }
+    }
+
+    res.json({
+      subscribed: true,
+      referrer: referrerPhone || 'referred',
+      pro_until: proUntil,
+    });
   } catch (e) {
     return sendFailure(req, res, e);
   }
@@ -1156,38 +1253,14 @@ app.get('/meals/:phone', requireAuth, async (req, res) => {
   }
 });
 
-// ─── Meal restore/remove aliases the app actually calls ─────────────────
-// The app's MealSyncService always used GET /meals/list/:phone and
-// POST /meals/remove, which never existed on the server (restore and delete
-// were silently 404ing). These mirror the Postgres + Firestore behaviour.
-app.get('/meals/list/:phone', requireAuth, async (req, res) => {
-  try {
-    // Legacy route — identity comes from the token, not the path.
-    const phone = identityOf(req).identifier;
-    const result = await dbq('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
-    res.json(result.rows);
-  } catch (e) {
-    return sendFailure(req, res, e);
-  }
-});
-
-app.post('/meals/remove', requireAuth, async (req, res) => {
-  try {
-    const { meal_id } = req.body;
-    const phone = identityOf(req).identifier;
-    if (!phone || !meal_id) return res.status(400).json({ error: 'Phone and meal_id required' });
-    await dbq('DELETE FROM meals WHERE id = $1 AND phone = $2', [meal_id, phone]);
-    // Firestore mirror (best-effort)
-    const fUid = await firestore.resolveUid(phone);
-    if (fUid) {
-      await firestore.del('meals/' + meal_id);
-    }
-    res.json({ removed: true });
-  } catch (e) {
-    return sendFailure(req, res, e);
-  }
-});
-
+// ─── Meal backup ───────────────────────────────────────────────────────────
+// REMOVED: GET /meals/list/:phone and POST /meals/remove (audit).
+// A comment here used to claim "the app's MealSyncService always used" them,
+// which is false: MealSyncService writes and reads the `meals` COLLECTION IN
+// CLOUD FIRESTORE directly (lib/services/meal_sync_service.dart), and there is
+// not a single `meals/list` or `meals/remove` string anywhere in the app. They
+// date from Phase 1 (f2ff4c5), before that migration. Dead routes are attack
+// surface for nothing in return, so they are gone.
 app.post('/meals/sync', requireAuth, async (req, res) => {
   try {
     const { meals, meal } = req.body;
@@ -1249,101 +1322,13 @@ app.post('/meals/sync', requireAuth, async (req, res) => {
   }
 });
 
-// ─── Habits & Water Log backup ────────────────────────────────────────
-// Stores the user's full habit list + water log as JSON so the app can
-// restore them after a reinstall. The Flutter app's MealSyncService hits
-// /habits/sync and /habits/list/:phone — these were MISSING, which is why
-// synced habits never came back after reinstalling the app.
-app.post('/habits/sync', requireAuth, async (req, res) => {
-  try {
-    const { habits, water_log, water_goal } = req.body;
-    const phone = identityOf(req).identifier;
-    if (!phone) return res.status(400).json({ error: 'Phone required' });
-    if (!Array.isArray(habits)) return res.status(400).json({ error: 'habits must be an array' });
-    await dbq(
-      `INSERT INTO habit_data (phone, habits, water_log, water_goal, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
-       ON CONFLICT (phone) DO UPDATE SET
-         habits = EXCLUDED.habits,
-         water_log = EXCLUDED.water_log,
-         water_goal = EXCLUDED.water_goal,
-         updated_at = NOW()`,
-      [phone, JSON.stringify(habits), JSON.stringify(water_log || {}), water_goal || 8]
-    );
-
-    // Firestore mirror: upsert the user's habitData doc (matches the
-    // Postgres ON CONFLICT upsert; best-effort).
-    {
-      const fUid = await firestore.resolveUid(phone);
-      if (fUid) {
-        await firestore.set('habitData/' + fUid, {
-          habits: habits,
-          waterLog: water_log || {},
-          waterGoal: water_goal || 8,
-          updatedAt: new Date(),
-        });
-      }
-    }
-    res.json({ synced: true });
-  } catch (e) {
-    return sendFailure(req, res, e);
-  }
-});
-
-app.get('/habits/list/:phone', requireAuth, async (req, res) => {
-  try {
-    // Legacy route — identity comes from the token, not the path.
-    const phone = identityOf(req).identifier;
-    const result = await dbq(
-      'SELECT habits, water_log, water_goal FROM habit_data WHERE phone = $1',
-      [phone]
-    );
-    const row = result.rows[0];
-    if (!row) {
-      return res.json({ habits: [], water_log: {}, water_goal: 8 });
-    }
-    res.json({
-      habits: row.habits || [],
-      water_log: row.water_log || {},
-      water_goal: row.water_goal || 8,
-    });
-  } catch (e) {
-    return sendFailure(req, res, e);
-  }
-});
-
-// Legacy admin/test hook: only ever flips the CALLER's own subscription.
-app.post('/subscribe', requireAuth, async (req, res) => {
-  try {
-    const phone = identityOf(req).identifier;
-    if (!phone) return res.status(400).json({ error: 'Identity required' });
-    await dbq('INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true', [phone]);
-    // Firestore mirror (best-effort).
-    {
-      const fUid = await firestore.resolveUid(phone);
-      if (fUid) await firestore.set('users/' + fUid, { subscribed: true }, { merge: true });
-    }
-    res.json({ subscribed: true });
-  } catch (e) {
-    return sendFailure(req, res, e);
-  }
-});
-
-app.post('/unsubscribe', requireAuth, async (req, res) => {
-  try {
-    const phone = identityOf(req).identifier;
-    if (!phone) return res.status(400).json({ error: 'Identity required' });
-    await dbq('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
-    // Firestore mirror (best-effort).
-    {
-      const fUid = await firestore.resolveUid(phone);
-      if (fUid) await firestore.set('users/' + fUid, { subscribed: false }, { merge: true });
-    }
-    res.json({ subscribed: false });
-  } catch (e) {
-    return sendFailure(req, res, e);
-  }
-});
+// ─── Habits & Water Log ─────────────────────────────────────────────────────
+// REMOVED: POST /habits/sync and GET /habits/list/:phone (audit).
+// The comment that used to sit here said the Flutter app's MealSyncService
+// "hits" these routes. It does not: habits are written to and read from the
+// `habitData` COLLECTION IN CLOUD FIRESTORE (MealSyncService ->
+// _db.collection('habitData')), and the app contains no '/habits/sync' or
+// '/habits/list' call anywhere. They were dead, so they are removed.
 
 // ─── Razorpay: Create Recurring Subscription ───────────────────────────────
 // Real ₹29/month recurring billing: creates a Razorpay Subscription (auto-
@@ -2099,6 +2084,10 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
         if (doc.exists && doc.data().subscribed === true) {
           return res.json({ subscribed: true });
         }
+        // A referral's 30-day window counts as Pro until pro_until passes.
+        if (doc.exists && proUntilActive(doc.data().pro_until)) {
+          return res.json({ subscribed: true, pro_until: doc.data().pro_until });
+        }
         // An active 30-day free trial counts as Pro until it expires.
         if (doc.exists) {
           const ts = trialState(doc.data().trial_started_at);
@@ -2110,14 +2099,15 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
     // Postgres fallback (legacy / when Firestore has no user doc).
     let user = null;
     if (phone) {
-      const r = await dbq('SELECT subscribed FROM users WHERE phone = $1 LIMIT 1', [phone]);
+      const r = await dbq('SELECT subscribed, pro_until FROM users WHERE phone = $1 LIMIT 1', [phone]);
       user = r.rows[0] || null;
     }
     if (!user && email) {
-      const r = await dbq('SELECT subscribed FROM users WHERE email = $1 LIMIT 1', [email]);
+      const r = await dbq('SELECT subscribed, pro_until FROM users WHERE email = $1 LIMIT 1', [email]);
       user = r.rows[0] || null;
     }
     if (user?.subscribed) return res.json({ subscribed: true });
+    if (proUntilActive(user && user.pro_until)) return res.json({ subscribed: true, pro_until: user.pro_until });
     const ts = await pgTrial(identifier);
     if (ts.active) return res.json({ subscribed: true, trial_days_left: ts.daysLeft, trial_ends_at: ts.endsAt });
     res.json({ subscribed: false });

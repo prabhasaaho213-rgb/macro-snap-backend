@@ -229,13 +229,7 @@ const PROTECTED = [
   ['get', '/me/referral-code'],
   ['post', '/referral/apply'],
   ['get', '/meals/:phone'],
-  ['get', '/meals/list/:phone'],
-  ['post', '/meals/remove'],
   ['post', '/meals/sync'],
-  ['post', '/habits/sync'],
-  ['get', '/habits/list/:phone'],
-  ['post', '/subscribe'],
-  ['post', '/unsubscribe'],
   ['post', '/payment/create-subscription'],
   ['post', '/payment/verify'],
   ['get', '/me/payment/status'],
@@ -246,6 +240,23 @@ const PROTECTED = [
   ['post', '/chat'],
   ['get', '/subscription/status'],
 ];
+
+// Routes the audit removed. Kept as a list so a "helpful" re-addition of any
+// of them fails the suite below instead of quietly reopening the hole.
+const REMOVED = [
+  ['post', '/subscribe'], // any signed-in user could self-grant permanent Pro
+  ['post', '/unsubscribe'],
+  ['get', '/meals/list/:phone'],
+  ['post', '/meals/remove'],
+  ['post', '/habits/sync'],
+  ['get', '/habits/list/:phone'],
+];
+
+test('auth: removed routes are gone — nothing may re-add them', () => {
+  for (const [method, path] of REMOVED) {
+    assert.ok(!routes[method][path], `${method.toUpperCase()} ${path} must NOT exist`);
+  }
+});
 
 test('auth: every protected route is registered and 401s a guest with no token', async () => {
   for (const [method, path] of PROTECTED) {
@@ -507,6 +518,75 @@ test('analyze: a real identification is still charged (the refund is not a free 
   assert.equal(res.body.scans_used, 1, 'a confident result still spends a scan');
   assert.equal(res.body.scans_remaining, 2);
   assert.equal(fsDocs.users.uidA.scanCount, 1);
+});
+
+// ── Referral reward is a 30-day window, never a permanent flag ──────────
+// The old version wrote `subscribed: true` with no end date and only checked
+// "already used" against Postgres — which production does not run, so that
+// guard never fired on the live path.
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+test('referral/apply: grants ~30 days of Pro and never writes a permanent flag', async () => {
+  fsDocs.referrals = { ABCD: { uid: 'uidB' } }; // uidB owns the code
+  const res = makeRes();
+  await callRoute('post', '/referral/apply', makeReq({ body: { code: 'abcd' } }, 'token-a'), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.subscribed, true, 'the app reads this field as the reward');
+
+  const proUntil = Date.parse(res.body.pro_until);
+  assert.ok(proUntil > Date.now() + 28 * DAY_MS && proUntil <= Date.now() + 31 * DAY_MS,
+    'the reward must be about 30 days, not forever');
+
+  // THE BUG BEING FIXED: a permanent `subscribed: true` must never be written.
+  assert.notEqual(fsDocs.users.uidA.subscribed, true,
+    'a referral must not grant permanent Pro');
+  assert.equal(fsDocs.users.uidA.referredBy, 'ABCD');
+  assert.ok(fsDocs.users.uidB.pro_until, 'the referrer earns the window too');
+  assert.notEqual(fsDocs.users.uidB.subscribed, true,
+    'the referrer is capped too — one code must not buy forever Pro');
+});
+
+test('referral/apply: a code cannot be applied twice (Firestore is the guard)', async () => {
+  fsDocs.referrals = { ABCD: { uid: 'uidB' } };
+  const first = makeRes();
+  await callRoute('post', '/referral/apply', makeReq({ body: { code: 'abcd' } }, 'token-a'), first);
+  assert.equal(first.statusCode, 200);
+
+  const second = makeRes();
+  await callRoute('post', '/referral/apply', makeReq({ body: { code: 'ABCD' } }, 'token-a'), second);
+  assert.equal(second.statusCode, 400);
+  assert.equal(second.body.error, 'Already used a referral code');
+  assert.ok(Date.parse(fsDocs.users.uidB.pro_until) <= Date.now() + 31 * DAY_MS,
+    'the referrer earns ONE window, not one per submission');
+});
+
+test('referral/apply: your own code is rejected on the Firestore path', async () => {
+  // The old guard compared the referrer's PHONE, which is NULL when Postgres
+  // is absent, against a non-null identifier — so it could never fire here.
+  fsDocs.referrals = { OWN: { uid: 'uidA' } };
+  const res = makeRes();
+  await callRoute('post', '/referral/apply', makeReq({ body: { code: 'own' } }, 'token-a'), res);
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.error, 'Cannot use your own code');
+  // The whole `users` collection must still be untouched — the guard fires
+  // before any write, so there is no users doc to assert on.
+  assert.ok(!fsDocs.users || fsDocs.users.uidA === undefined,
+    'nothing may be granted to a self-referral');
+});
+
+test('subscription/status: a live referral window is Pro, an expired one is not', async () => {
+  fsDocs.users = { uidA: { pro_until: new Date(Date.now() + DAY_MS).toISOString() } };
+  const live = makeRes();
+  await callRoute('get', '/subscription/status', makeReq({}, 'token-a'), live);
+  assert.equal(live.body.subscribed, true, 'a live window must unlock Pro');
+
+  fsDocs.users = { uidA: { pro_until: new Date(Date.now() - DAY_MS).toISOString() } };
+  const expired = makeRes();
+  await callRoute('get', '/subscription/status', makeReq({}, 'token-a'), expired);
+  assert.equal(expired.body.subscribed, false,
+    'an expired referral must drop the user back to free');
 });
 
 test('restored after tests', () => { global.fetch = origFetch; });
