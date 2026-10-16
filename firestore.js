@@ -134,4 +134,11 @@ function getDb() {
   return db;
 }
 
-module.exports = { init, isEnabled, resolveUid, set, del, getDb };
+// The raw Admin SDK, for callers that need more than the safe helpers above
+// (auth.js verifies Firebase ID tokens with it). Returns null when dual-write
+// is disabled — callers MUST treat that as "cannot verify" and fail closed.
+function getAdmin() {
+  return admin;
+}
+
+module.exports = { init, isEnabled, resolveUid, set, del, getDb, getAdmin };

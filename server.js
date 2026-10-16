@@ -4,12 +4,22 @@ const multer = require('multer');
 const sharp = require('sharp');
 const { Pool } = require('pg');
 const firestore = require('./firestore');
+const { requireAuth, identityOf } = require('./auth');
 
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
+// Uploads are buffered in MEMORY, so an unbounded body is an unbounded RAM
+// allocation per request — one oversized file could take the process down.
+// Cap it well above anything the app actually sends (the client compresses to
+// a ~1024px JPEG) and let multer reject anything bigger with LIMIT_FILE_SIZE,
+// which the error handler below turns into a clean 413.
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
+});
 
 // Capture the raw request body for every request so the Razorpay payment
 // webhook can verify its HMAC signature against the exact bytes sent
@@ -37,13 +47,125 @@ async function dbq(sql, params) {
     return await pool.query(sql, params);
   } catch (e) {
     console.error('DB query failed (continuing without Postgres):', e.message);
-    return { rows: [] };
+    // _failed lets callers distinguish "query errored" from "clean miss" —
+    // security checks (the deletion tombstone) must fail closed on errors.
+    return { rows: [], _failed: true };
   }
 }
 
 // Gemini model — the 2.5 generation is retired for new API keys (2026), so
 // the default is a current vision-capable lite model. Override via GEMINI_MODEL.
+//
+// Verify what YOUR key can actually use with the Models API (the listing lives
+// under v1beta, not v1):
+//   curl 'https://generativelanguage.googleapis.com/v1beta/models' \
+//     -H "x-goog-api-key: $GEMINI_KEY"
+// then pick an id whose supportedGenerationMethods include generateContent.
+// A model that is in the public catalogue can still be unavailable to a given
+// key, so this is the only real confirmation.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+
+// The API version is configurable because the newest models are not always
+// served on every version: the Models API itself is documented under v1beta,
+// while v1 is the long-stable surface. If a key reports the model as not found
+// on v1, switch to v1beta (or another model) with an env var rather than a
+// code change — no redeploy of logic, just a variable.
+const GEMINI_API_VERSION = process.env.GEMINI_API_VERSION || 'v1';
+
+// One call site for Gemini's generateContent, so the API key lives in exactly
+// one place. The key goes in the x-goog-api-key HEADER, never the URL: a
+// ?key= query string leaks into request logs, proxies, and any error message
+// that echoes the URL. (Authorization: Bearer is for OAuth access tokens, not
+// for API keys, so it is deliberately not used here.)
+async function geminiGenerate(body) {
+  return fetch(
+    `https://generativelanguage.googleapis.com/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': String(process.env.GEMINI_KEY || ''),
+      },
+      // Accepts a pre-stringified body or a plain object, whichever the
+      // caller already has (the /analyze prompt is built as a string).
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    }
+  );
+}
+
+// ─── Per-user rate limiting ──────────────────────────────────────────────
+// Every route below calls Gemini on our API key, so an unthrottled endpoint
+// is an open-ended bill. This is a simple fixed-window counter per user per
+// route — no dependency, and no state to lose on serverless cold starts
+// (worst case a burst gets one extra window, which is still bounded).
+//
+// Keyed on the VERIFIED uid, never on a client-supplied field, so one user
+// cannot evade the cap by rotating a header. Guests (no uid) are keyed by
+// remote address, which is the only identity we have for them.
+const RATE_WINDOWS = {
+  // route            per-minute cap
+  '/chat': 30,
+  '/analyze': 20,
+  '/generate-diet-plan': 6,
+};
+const RATE_WINDOW_MS = 60 * 1000;
+const rateBuckets = new Map(); // key -> { windowStart, count }
+
+// Test seam: lets a test reset the counters without reaching into the Map.
+function resetRateLimits() {
+  rateBuckets.clear();
+}
+
+// Returns null when the caller may proceed, or the number of ms until the
+// next window when they have exceeded the cap.
+function rateLimitFor(bucketKey, limit) {
+  const now = Date.now();
+  let b = rateBuckets.get(bucketKey);
+  if (!b || now - b.windowStart >= RATE_WINDOW_MS) {
+    b = { windowStart: now, count: 0 };
+    rateBuckets.set(bucketKey, b);
+  }
+  b.count += 1;
+  return b.count > limit ? b.windowStart + RATE_WINDOW_MS - now : null;
+}
+
+// Express guard for one of the RATE_WINDOWS routes. 429 with Retry-After.
+function rateLimit(route) {
+  const limit = RATE_WINDOWS[route];
+  return (req, res, next) => {
+    const uid = (req.user && req.user.uid) || null;
+    const key = uid || (req.ip || 'anon') + ':' + route;
+    const retryAfterMs = rateLimitFor(key + ':' + route, limit);
+    if (retryAfterMs == null) return next();
+    res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+    return res.status(429).json({
+      error: 'rate_limited',
+      message: 'Too many requests. Please wait a moment and try again.',
+      retry_after_ms: retryAfterMs,
+    });
+  };
+}
+
+// ─── Safe error replies ──────────────────────────────────────────────────
+// A raw e.message can leak internals: Gemini's own error text, a Postgres
+// column name, a filesystem path. Known, deliberate messages (thrown as
+// SafeError) reach the user; everything else becomes a generic apology and
+// is logged server-side instead.
+class SafeError extends Error {}
+
+// Every catch block below funnels through here. `req.route.path` names the
+// route in the server log (falling back to 'api' when the harness omits it),
+// so an operator can still trace a failure without the client seeing guts.
+function sendFailure(req, res, e) {
+  if (e instanceof SafeError) {
+    return res.status(500).json({ error: e.message });
+  }
+  const route = (req && req.route && req.route.path) || (req && req.originalUrl) || 'api';
+  console.error(`[${route}]`, e && e.stack ? e.stack : e);
+  return res.status(500).json({
+    error: 'Something went wrong. Please try again.',
+  });
+}
 
 // Razorpay is optional: when the keys are unset the server still runs (the
 // payment endpoints return a clear 'not configured' error instead).
@@ -94,8 +216,22 @@ async function getPlanId() {
   return plan.id;
 }
 
+// A malformed JSON body is a CLIENT BUG, not a success. This used to answer
+// 200 {ok:true}, which quietly hid broken requests — worst on /payment/verify,
+// where an "ok" response reads like a verified payment. It is a 400 now.
+//
+// Registered as error middleware, so Express routes everything that calls
+// next(err) here, including express.json() above and multer's body limits.
 app.use((err, req, res, next) => {
-  if (err.type === 'entity.parse.failed') return res.status(200).json({ ok: true });
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'invalid_json', message: 'Request body must be valid JSON.' });
+  }
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'image_too_large', message: 'Image is too large. Please send a photo under 10 MB.' });
+  }
+  if (err && err.code === 'LIMIT_FILE_COUNT') {
+    return res.status(400).json({ error: 'too_many_files', message: 'Send exactly one image.' });
+  }
   next(err);
 });
 
@@ -149,9 +285,17 @@ async function initDB(retries = 5) {
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT DEFAULT ''"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_count INTEGER DEFAULT 0"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_month INTEGER DEFAULT 0"); } catch (_) {}
+        // The free-scan counter is per IST DAY now (YYYY-MM-DD), not per
+        // calendar month — see istDayKey().
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_day TEXT"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by TEXT"); } catch (_) {}
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_id TEXT"); } catch (_) {}
+        // trial_started_at was missing from both CREATE TABLE and this ALTER
+        // list, so every Postgres trial read/grant silently failed and
+        // /trial/status re-issued an UNPERSISTED fresh 30-day window on each
+        // check. Adding it makes the one-time grant actually persist.
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ"); } catch (_) {}
         try { await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_code ON users (referral_code)"); } catch (_) {}
         await client.query(`
           CREATE TABLE IF NOT EXISTS payments (
@@ -161,6 +305,19 @@ async function initDB(retries = 5) {
             amount INTEGER DEFAULT 29,
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW()
+          );
+        `);
+        // Deletion tombstone: remembers an account's identifier (phone/email)
+        // and its ORIGINAL trial start AFTER the account is deleted. This is
+        // what stops a delete -> re-login -> fresh free-trial loop — see
+        // getDeletionTombstone()/getOrGrantTrial(). Never wiped.
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS deleted_accounts (
+            identifier TEXT PRIMARY KEY,
+            phone TEXT,
+            email TEXT,
+            trial_started_at TIMESTAMPTZ,
+            deleted_at TIMESTAMPTZ DEFAULT NOW()
           );
         `);
         console.log('Database tables ready');
@@ -182,15 +339,40 @@ async function prepareImage(buffer, mimetype) {
   return sharp(buffer).jpeg().toBuffer();
 }
 
+// Free AI scans per IST day, per verified user. THE SERVER IS THE AUTHORITY:
+// the app's counter is only a display estimate (lib/services/scan_gate.dart).
 const SCAN_LIMIT_FREE = 3;
+
+// Asia/Kolkata is UTC+5:30 year-round (no DST), so IST is just a fixed
+// offset. Everything about the daily reset is derived from it — a UTC reset
+// would hand Indian users a fresh allowance at 5:30 AM instead of midnight.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+// The IST calendar day ('YYYY-MM-DD') a scan counts against.
+function istDayKey(now = Date.now()) {
+  return new Date(now + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+// The instant the current IST day ends (next IST midnight) as a UTC ISO
+// string, so the app can show a countdown to the reset.
+function istDayEndsAt(now = Date.now()) {
+  const start = Date.parse(`${istDayKey(now)}T00:00:00.000Z`) - IST_OFFSET_MS;
+  return new Date(start + 24 * 60 * 60 * 1000).toISOString();
+}
 
 // The owner/admin account is always Pro — exempt from the free scan limit.
 // Mirrors SubscriptionService.adminEmail in the Flutter app. After Google
 // sign-in the app sends the user's email as the `phone` field, so a simple
 // case-insensitive match identifies the admin here.
+//
+// REQUIRES A VERIFIED EMAIL. `email_verified` is true for Google sign-in but
+// false for a brand-new email/password account — so without this check anyone
+// who enables that sign-in method and registers with the admin's address gets
+// free Pro. An unverified address must never claim the owner's privileges.
 const ADMIN_EMAIL = 'prabhasaaho213@gmail.com';
 
-function isAdminUser(identifier) {
+function isAdminUser(identifier, emailVerified) {
+  if (emailVerified !== true) return false;
   return typeof identifier === 'string' &&
     identifier.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase();
 }
@@ -220,10 +402,63 @@ function trialState(startedAt, now = Date.now()) {
   };
 }
 
+// Reads the deletion tombstone for an identifier (Postgres + Firestore).
+// Returns { found, trialStartedAt, errored }:
+//   found   = this account was deleted; trialStartedAt is the trial it had
+//             already consumed (null if it never claimed one).
+//   errored = a configured tombstone store could NOT be read, so "no
+//             tombstone" cannot be proven — getOrGrantTrial then fails
+//             closed and mints no fresh trial.
+// getOrGrantTrial uses this to never re-grant a fresh trial to a
+// deleted-and-re-registered account.
+async function getDeletionTombstone(identifier) {
+  const out = { found: false, trialStartedAt: null, errored: false };
+  // Firestore tombstone (deletedAccounts/{identifier}) — survives on the
+  // DB-less deployment and is keyed (lowercased) by identifier so it holds
+  // even after the Firebase Auth user (and its uid-keyed docs) are gone.
+  if (firestore.isEnabled()) {
+    try {
+      const idKey = String(identifier).toLowerCase();
+      const snap = await firestore.getDb().collection('deletedAccounts').doc(idKey).get();
+      if (snap.exists) {
+        const d = snap.data() || {};
+        return { found: true, trialStartedAt: d.trial_started_at || null, errored: false };
+      }
+    } catch (_) {
+      out.errored = true; // store unreachable — absence is unproven
+    }
+  }
+  // Postgres tombstone. Matched CASE-INSENSITIVELY: the same mail can
+  // arrive as 'User@x.com' at deletion time and 'user@x.com' at re-login,
+  // and an exact match would miss the tombstone and re-open the trial loop.
+  if (dbAvailable) {
+    const r = await dbq(
+      'SELECT trial_started_at FROM deleted_accounts WHERE LOWER(identifier) = LOWER($1) OR LOWER(phone) = LOWER($1) OR LOWER(email) = LOWER($1) LIMIT 1',
+      [identifier]
+    );
+    if (r._failed) out.errored = true;
+    else if (r.rows && r.rows.length > 0) {
+      return { found: true, trialStartedAt: r.rows[0].trial_started_at || null, errored: false };
+    }
+  }
+  return out;
+}
+
 // Reads the trial start for an identifier, granting the one-time trial when
 // no record exists yet. Returns the ISO start or null when nothing can be
 // stored (no Firestore doc and no DB) — the caller then reports no trial.
 async function getOrGrantTrial(identifier) {
+  // A deleted account can NEVER claim a fresh free trial. The tombstone
+  // preserves the ORIGINAL trial start (or null), so re-login after deletion
+  // reports the already-consumed trial (usually expired) instead of a new
+  // 30 days — this closes the delete -> re-register trial-abuse loop.
+  const tomb = await getDeletionTombstone(identifier);
+  if (tomb.found) return tomb.trialStartedAt;
+  // Fail closed: when the tombstone store could not be READ we cannot prove
+  // this identity never deleted its account — never mint a fresh trial.
+  // (Existing trials are still returned below, so a transient error never
+  // strips a legit countdown.)
+  const refuseFreshGrant = tomb.errored;
   const fUid = await firestore.resolveUid(identifier);
   if (fUid && firestore.isEnabled()) {
     try {
@@ -231,6 +466,7 @@ async function getOrGrantTrial(identifier) {
       const doc = await ref.get();
       const existing = doc.exists ? doc.data().trial_started_at : null;
       if (existing) return existing;
+      if (refuseFreshGrant) return null;
       const nowIso = new Date().toISOString();
       await firestore.set('users/' + fUid, { trial_started_at: nowIso }, { merge: true });
       return nowIso;
@@ -240,9 +476,23 @@ async function getOrGrantTrial(identifier) {
     const r = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
     const existing = r.rows[0] && r.rows[0].trial_started_at;
     if (existing) return existing;
+    if (refuseFreshGrant) return null;
     const nowIso = new Date().toISOString();
-    await dbq('UPDATE users SET trial_started_at = $2 WHERE phone = $1 OR email = $1', [identifier, nowIso]);
-    return nowIso;
+    // Persist the grant so it stays ONE-TIME. The old bare UPDATE matched
+    // no row for a brand-new identity, so every check silently re-issued a
+    // fresh 30-day window. Write only while absent, create the row when the
+    // identity has none, then report what actually got stored (null if
+    // nothing did — an unpersisted start would roll forever).
+    await dbq(
+      'UPDATE users SET trial_started_at = $2 WHERE (phone = $1 OR email = $1) AND trial_started_at IS NULL',
+      [identifier, nowIso]
+    );
+    await dbq(
+      'INSERT INTO users (phone, trial_started_at) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM users WHERE phone = $1 OR email = $1)',
+      [identifier, nowIso]
+    );
+    const back = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
+    return (back.rows[0] && back.rows[0].trial_started_at) || null;
   } catch (_) {
     return null; // DB-less legacy deployment without Firestore — no trial.
   }
@@ -258,67 +508,222 @@ async function pgTrial(identifier) {
   }
 }
 
-app.post('/analyze', upload.single('image'), async (req, res) => {
+// ─── Free-scan entitlements — the SERVER is the authority ─────────────────
+//
+// Reads this user's subscription/trial state and their daily scan counter in
+// ONE place, so /analyze, GET /me/entitlements and the 403 response can never
+// disagree. Identity comes from the verified token (see auth.js) — never from
+// anything the client typed.
+//
+// The counter resets at IST midnight: a value stored for a previous IST day
+// is stale and reads as zero, so a user gets a fresh 3 every Indian morning.
+async function entitlementsFor({ uid, identifier, emailVerified }) {
+  const day = istDayKey();
+  const resetAt = istDayEndsAt();
+  // The owner/admin account is always Pro — exempt from the free limit.
+  let subscribed = !!identifier && isAdminUser(identifier, emailVerified);
+  let trialEndsAt = null;
+  let storedDay = null;
+  let count = 0;
+
+  // Firestore users/{uid} is the source of truth (production runs DB-less).
+  if (uid && firestore.isEnabled()) {
+    try {
+      const doc = await firestore.getDb().collection('users').doc(uid).get();
+      const d = (doc.exists ? doc.data() : {}) || {};
+      if (d.subscribed === true) subscribed = true;
+      const ts = trialState(d.trial_started_at);
+      if (ts.active) {
+        subscribed = true;
+        trialEndsAt = ts.endsAt;
+      }
+      storedDay = d.scanDay || null;
+      count = Number(d.scanCount) || 0;
+    } catch (_) {}
+  }
+
+  // Postgres fallback (legacy deployments).
+  if (dbAvailable && identifier) {
+    if (!subscribed) {
+      const u = await dbq(
+        'SELECT subscribed, trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1',
+        [identifier]
+      );
+      const row = u.rows[0];
+      if (row && row.subscribed) subscribed = true;
+      const ts = trialState(row && row.trial_started_at);
+      if (ts.active) {
+        subscribed = true;
+        trialEndsAt = ts.endsAt;
+      }
+    }
+    if (storedDay === null) {
+      const r = await dbq('SELECT scan_count, scan_day FROM users WHERE phone = $1 LIMIT 1', [identifier]);
+      const row = r.rows[0] || {};
+      storedDay = row.scan_day || null;
+      count = Number(row.scan_count) || 0;
+    }
+  }
+
+  const used = storedDay === day ? count : 0;
+  return {
+    subscribed,
+    scans_used: used,
+    // null = no limit (Pro/admin). The app shows "Unlimited" then.
+    scans_limit: subscribed ? null : SCAN_LIMIT_FREE,
+    scans_remaining: subscribed ? null : Math.max(0, SCAN_LIMIT_FREE - used),
+    scan_day: day,
+    reset_at: resetAt,
+    trial_ends_at: trialEndsAt,
+  };
+}
+
+// ── Atomic scan reservation ────────────────────────────────────────────────
+//
+// The old flow checked the count up front and only incremented AFTER Gemini
+// answered. Two requests in flight at the same moment both read "2 of 3
+// used", both passed the check, and both got a scan — so parallel requests
+// walked straight past the free limit. The increment was also a plain
+// read-then-write, which loses updates under concurrency.
+//
+// Fix: take the scan BEFORE the expensive call, in ONE atomic step that both
+// checks and increments. If the analysis later fails, [releaseScan] hands the
+// scan back, so a Gemini error never costs the user an allowance.
+//
+// Firestore uses a real transaction (read -> decide -> write), so two
+// concurrent requests serialise and cannot both pass the same limit check.
+// Postgres does the same check-and-increment in a single conditional
+// statement, which is atomic by construction.
+
+// Reserves one free scan for today. Returns { ok, used } — used is the count
+// AFTER the reservation, or the unchanged count when ok is false.
+async function reserveScan({ uid, identifier, day }) {
+  if (uid && firestore.isEnabled()) {
+    const db = firestore.getDb();
+    const ref = db.collection('users').doc(uid);
+    try {
+      return await db.runTransaction(async (tx) => {
+        const doc = await tx.get(ref);
+        const d = (doc.exists ? doc.data() : {}) || {};
+        const used = d.scanDay === day ? (Number(d.scanCount) || 0) : 0;
+        if (used >= SCAN_LIMIT_FREE) return { ok: false, used };
+        tx.set(ref, { scanCount: used + 1, scanDay: day }, { merge: true });
+        return { ok: true, used: used + 1 };
+      });
+    } catch (_) {
+      // Unreachable / no transaction support — fail closed: no scan granted.
+      return { ok: false, used: null };
+    }
+  }
+  if (dbAvailable && identifier) {
+    // One statement: insert-or-conditionally-increment. The WHERE on the
+    // DO UPDATE clause is what makes the limit check atomic — when it fails,
+    // no row comes back and the caller treats it as "limit reached".
+    const r = await dbq(
+      `INSERT INTO users (phone, scan_day, scan_count) VALUES ($1, $2, 1)
+       ON CONFLICT (phone) DO UPDATE SET
+         scan_day = EXCLUDED.scan_day,
+         scan_count = CASE WHEN users.scan_day = EXCLUDED.scan_day
+                           THEN COALESCE(users.scan_count, 0) + 1 ELSE 1 END
+       WHERE users.scan_day IS DISTINCT FROM EXCLUDED.scan_day
+          OR COALESCE(users.scan_count, 0) < $3
+       RETURNING scan_count`,
+      [identifier, day, SCAN_LIMIT_FREE]
+    );
+    if (r._failed) return { ok: false, used: null };
+    if (r.rows && r.rows[0]) return { ok: true, used: r.rows[0].scan_count };
+    return { ok: false, used: null }; // limit genuinely reached
+  }
+  // No counter store at all — allow the scan but count nothing (legacy
+  // DB-less deployments keep working exactly as before).
+  return { ok: true, used: null };
+}
+
+// Hands a reserved scan back after a failed analysis. Best-effort: a lost
+// refund only over-counts by one, which is strictly better than the old
+// behaviour of granting extra scans.
+async function releaseScan({ uid, identifier, day }) {
+  if (uid && firestore.isEnabled()) {
+    const db = firestore.getDb();
+    const ref = db.collection('users').doc(uid);
+    try {
+      await db.runTransaction(async (tx) => {
+        const doc = await tx.get(ref);
+        const d = (doc.exists ? doc.data() : {}) || {};
+        if (d.scanDay !== day) return;
+        const used = Number(d.scanCount) || 0;
+        if (used <= 0) return;
+        tx.set(ref, { scanCount: used - 1, scanDay: day }, { merge: true });
+      });
+    } catch (_) {}
+    return;
+  }
+  if (dbAvailable && identifier) {
+    await dbq(
+      'UPDATE users SET scan_count = GREATEST(COALESCE(scan_count, 0) - 1, 0) WHERE phone = $1 AND scan_day = $2',
+      [identifier, day]
+    );
+  }
+}
+
+app.post('/analyze', requireAuth, upload.single('image'), rateLimit('/analyze'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
 
-    const phone = req.body?.phone || '';
-    if (phone) {
-      const now = new Date();
-      const currentMonth = now.getFullYear() * 12 + now.getMonth();
-      const fUid = await firestore.resolveUid(phone);
-      // The owner is always subscribed, so the free limit never applies.
-      let subscribed = isAdminUser(phone);
-      let count = 0;
-      let scanMonth = 0;
-      let fsTrial = null; // Firestore trial_started_at on the DB-less path
-      if (dbAvailable) {
-        // Postgres path (source of truth when a DB is configured).
-        const user = await dbq('SELECT subscribed, scan_count, scan_month FROM users WHERE phone = $1', [phone]);
-        if (user.rows.length > 0) {
-          count = user.rows[0].scan_count || 0;
-          scanMonth = user.rows[0].scan_month || 0;
-        } else {
-          await dbq('INSERT INTO users (phone, scan_count, scan_month) VALUES ($1, 0, $2) ON CONFLICT (phone) DO NOTHING', [phone, currentMonth]);
-        }
-      } else if (fUid) {
-        // DB-less path: scan counters live in users/{uid} (Firestore).
-        const doc = await firestore.getDb().collection('users').doc(fUid).get();
-        const d = doc.exists ? doc.data() : {};
-        count = d.scanCount || 0;
-        scanMonth = d.scanMonth || 0;
-        fsTrial = d.trial_started_at || null;
-      }
-      // A user inside the 30-day free trial has Pro perks — the free scan
-      // cap must not apply to them.
-      if (!subscribed && !dbAvailable) subscribed = trialState(fsTrial).active;
-      if (!subscribed && dbAvailable) subscribed = (await pgTrial(phone)).active;
-      // The owner is ALWAYS subscribed — the DB lookup above must never
-      // downgrade them. Without this, an admin whose stored row/doc says
-      // subscribed=false (e.g. never paid via Razorpay) gets 403'd at the
-      // free scan limit, exactly like a free user.
-      subscribed = subscribed || isAdminUser(phone);
-      if (!subscribed) {
-        if (scanMonth !== currentMonth) {
-          count = 0;
-          scanMonth = currentMonth;
-        }
-        if (count >= SCAN_LIMIT_FREE) {
-          return res.status(403).json({ error: 'scan_limit_reached', scans_used: count, scans_limit: SCAN_LIMIT_FREE });
-        }
-      }
-      // Carry state so the post-analysis increment updates the right store.
-      req._scan = { phone, fUid, currentMonth, count, dbAvailable };
+    // Identity comes from the VERIFIED TOKEN (auth.js) — the name is not
+    // taken from req.body, so one user can never spend another user's scans
+    // (or dodge their own limit) by sending a different phone/email.
+    const id = identityOf(req);
+    const ent = await entitlementsFor(id);
+    if (!ent.subscribed && ent.scans_used >= SCAN_LIMIT_FREE) {
+      return res.status(403).json({
+        error: 'scan_limit_reached',
+        scans_used: ent.scans_used,
+        scans_limit: SCAN_LIMIT_FREE,
+        scans_remaining: 0,
+        scan_day: ent.scan_day,
+        reset_at: ent.reset_at,
+      });
     }
 
-    const key = process.env.GEMINI_KEY;
-    const jpegBuffer = await prepareImage(req.file.buffer, req.file.mimetype);
-    const base64 = jpegBuffer.toString('base64');
+    // Take the scan BEFORE the expensive AI call, in one atomic
+    // check-and-increment. Reserving up front is what closes the parallel
+    // request hole: N simultaneous requests can no longer all read "2 of 3
+    // used" and all pass. Pro/admin never reserve (no limit to spend).
+    let reservation = null;
+    if (!ent.subscribed) {
+      const r = await reserveScan({ uid: id.uid, identifier: id.identifier, day: ent.scan_day });
+      if (!r.ok) {
+        // Either the allowance is genuinely gone, or the counter store
+        // could not be written. Both fail closed — no free analysis.
+        const usedCount = r.used == null ? SCAN_LIMIT_FREE : r.used;
+        return res.status(403).json({
+          error: 'scan_limit_reached',
+          scans_used: usedCount,
+          scans_limit: SCAN_LIMIT_FREE,
+          scans_remaining: Math.max(0, SCAN_LIMIT_FREE - usedCount),
+          scan_day: ent.scan_day,
+          reset_at: ent.reset_at,
+        });
+      }
+      reservation = r;
+    }
 
-    const body = JSON.stringify({
-      contents: [{
-        parts: [
-          { text: `You are a professional nutritionist. The photo shows food — it may be from ANY cuisine: Indian, South Asian, Western, bakery & desserts, street food, fruits, packaged foods, etc. Name EVERY visible food item ACCURATELY as it actually is (for example "Chocolate cake", "Donut", "Rice with dal", "Butter chicken", "Pizza", "Banana"). NEVER force a food into a different dish: a cake is a cake, a cookie is a cookie — do NOT relabel desserts or baked goods as Indian sweets. If the food is a dessert, baked good, snack, or any non-Indian item, identify it precisely and use its standard nutrition data. Return ONLY valid JSON:
+    // From here on the scan is paid for. Any failure below must hand it
+    // back, so a Gemini error never burns a user's allowance.
+    const refundScan = () => {
+      if (reservation) releaseScan({ uid: id.uid, identifier: id.identifier, day: ent.scan_day });
+    };
+
+    let json;
+    try {
+      const jpegBuffer = await prepareImage(req.file.buffer, req.file.mimetype);
+      const base64 = jpegBuffer.toString('base64');
+
+      const body = JSON.stringify({
+        contents: [{
+          parts: [
+            { text: `You are a professional nutritionist. The photo shows food — it may be from ANY cuisine: Indian, South Asian, Western, bakery & desserts, street food, fruits, packaged foods, etc. Name EVERY visible food item ACCURATELY as it actually is (for example "Chocolate cake", "Donut", "Rice with dal", "Butter chicken", "Pizza", "Banana"). NEVER force a food into a different dish: a cake is a cake, a cookie is a cookie — do NOT relabel desserts or baked goods as Indian sweets. If the food is a dessert, baked good, snack, or any non-Indian item, identify it precisely and use its standard nutrition data. Return ONLY valid JSON:
 {
   "description": "brief summary of what was detected",
   "confidence": estimated accuracy 0-1,
@@ -337,45 +742,34 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
   ]
 }
 Rules: 1 dish entry per visible item. Be specific about the portion. Use standard nutrition data. If unsure, name the most likely food rather than guessing an Indian equivalent. Return ONLY raw JSON. No markdown. No backticks.` },
-          { inlineData: { mimeType: 'image/jpeg', data: base64 } }
-        ]
-      }]
-    });
+            { inlineData: { mimeType: 'image/jpeg', data: base64 } }
+          ]
+        }]
+      });
 
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body
-    });
+      const resp = await geminiGenerate(body);
 
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
 
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (!text) throw new Error('Empty response from AI');
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+      if (!text) throw new Error('Empty response from AI');
 
-    const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
-    const json = JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
-
-    const now = new Date();
-    const currentMonth = now.getFullYear() * 12 + now.getMonth();
-    let scansUsed = 0;
-    if (req._scan) {
-      const { phone, fUid, count, dbAvailable: hadDb } = req._scan;
-      // The admin's scans are never counted — their account is always Pro.
-      if (!isAdminUser(phone)) {
-        scansUsed = count + 1;
-        if (hadDb) {
-          await dbq('UPDATE users SET scan_count = COALESCE(scan_count, 0) + 1 WHERE phone = $1', [phone]);
-          const updated = await dbq('SELECT scan_count FROM users WHERE phone = $1', [phone]);
-          scansUsed = updated?.rows[0]?.scan_count || scansUsed;
-        }
-        // Firestore mirror — also the counter's source when Postgres is absent.
-        if (fUid) {
-          await firestore.set('users/' + fUid, { scanCount: scansUsed, scanMonth: currentMonth }, { merge: true });
-        }
-      }
+      const cleaned = text.replace(/```json?/g, '').replace(/```/g, '').trim();
+      json = JSON.parse(cleaned.substring(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));
+    } catch (e) {
+      // The analysis failed AFTER the scan was reserved — hand it back so a
+      // Gemini/parse error never costs the user an allowance.
+      refundScan();
+      throw e;
     }
+
+    // The scan was already reserved up front, so there is nothing left to
+    // increment here — these are just the numbers the reservation produced.
+    // Pro/admin never reserved, so they still report the untouched count.
+    let scansUsed = reservation ? reservation.used : ent.scans_used;
+    let scansLimit = ent.subscribed ? null : SCAN_LIMIT_FREE;
+
     let dishes = json.dishes;
     if (!dishes || !Array.isArray(dishes) || dishes.length === 0) {
       dishes = [{
@@ -406,11 +800,41 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
         suitable_for: d.suitable_for || 'both'
       })),
       scans_used: scansUsed,
-      scans_limit: SCAN_LIMIT_FREE
+      scans_limit: scansLimit,
+      scans_remaining: scansLimit == null ? null : Math.max(0, scansLimit - scansUsed),
+      subscribed: ent.subscribed,
+      scan_day: ent.scan_day,
+      reset_at: ent.reset_at
     };
+
+    // A low-confidence or "Unknown" result is not a real identification. The
+    // app's low-confidence banner tells the user such a scan is NOT counted,
+    // so honour that promise: hand the reservation back and report the
+    // corrected numbers. Without this the server kept the scan while the app
+    // showed it as free, so the user's remaining count drifted below the
+    // server's and a later scan 403'd with no warning.
+    //
+    // The rule mirrors the app EXACTLY (confidence < 0.5, or an "Unknown"
+    // dish) so the two sides never disagree. Pro/admin hold no reservation,
+    // so this is a no-op for them. The /analyze rate limit still bounds how
+    // much Gemini work a stream of unidentified images can trigger.
+    if (reservation) {
+      const unidentified =
+        normalized.confidence < 0.5 ||
+        normalized.dishes.some((d) => String(d.name || '').toLowerCase() === 'unknown');
+      if (unidentified) {
+        await releaseScan({ uid: id.uid, identifier: id.identifier, day: ent.scan_day });
+        const used = Math.max(0, reservation.used - 1);
+        reservation = null;
+        scansUsed = used;
+        normalized.scans_used = used;
+        normalized.scans_remaining = Math.max(0, SCAN_LIMIT_FREE - used);
+      }
+    }
+
     res.json(normalized);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -423,10 +847,26 @@ const planText = (plan) => [
   ...((plan && plan.tips) || []).map(String),
 ].join('\n');
 
-app.post('/generate-diet-plan', async (req, res) => {
+app.post('/generate-diet-plan', requireAuth, rateLimit('/generate-diet-plan'), async (req, res) => {
   try {
     const { weight, height, age, gender, goal, activity, diet } = req.body;
     if (!weight || !height || !age) return res.status(400).json({ error: 'Weight, height & age required' });
+
+    // The AI meal plan is a PRO feature, gated exactly like /chat: a plan is a
+    // Gemini call we pay for, so a signed-in free user must not be able to
+    // generate one. The app already shows free users the subscribe screen
+    // instead of the plan builder, but the client is not the authority — this
+    // is what makes that paywall real rather than cosmetic.
+    //
+    // Placed after the input check (matching /chat's order) so a malformed
+    // request is still reported as malformed, and before any work is done.
+    const ent = await entitlementsFor(identityOf(req));
+    if (!ent.subscribed) {
+      return res.status(403).json({
+        error: 'pro_required',
+        message: 'The AI meal plan is a Pro feature. Upgrade to build your plan.',
+      });
+    }
 
     const bmr = gender === 'male' ? 10 * weight + 6.25 * height - 5 * age + 5 : 10 * weight + 6.25 * height - 5 * age - 161;
     const multipliers = { sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, veryActive: 1.9 };
@@ -473,12 +913,7 @@ Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
 }`;
 
     const callGemini = async (p) => {
-      const key = process.env.GEMINI_KEY;
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: p }] }] })
-      });
+      const resp = await geminiGenerate({ contents: [{ parts: [{ text: p }] }] });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
@@ -500,22 +935,28 @@ Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
         'vegetarian — no meat, fish, poultry, eggs or seafood in any meal, snack or tip.'
       );
       if (NON_VEG_RE.test(planText(retry))) {
-        throw new Error('The AI could not produce a vegetarian plan. Please try again.');
+        // Deliberate, user-facing message — sent as SafeError so it survives
+        // the sanitizing catch below (diet_plan.test.js pins this wording).
+        throw new SafeError('The AI could not produce a vegetarian plan. Please try again.');
       }
       plan = retry;
     }
 
     res.json({ bmi: bmi.toFixed(1), bmr: Math.round(bmr), tdee: Math.round(tdee), targetCalories: Math.round(calTarget), targetProtein: proteinTarget.toFixed(0), targetCarbs: carbTarget.toFixed(0), targetFats: fatTarget.toFixed(0), plan });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.post('/register', async (req, res) => {
+app.post('/register', requireAuth, async (req, res) => {
   try {
-    const { phone, email, name } = req.body;
-    if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
-    const identifier = phone || email;
+    // The name is user data the client may choose; the IDENTITY is not — it
+    // comes from the verified token (auth.js), never from the request body.
+    const { name } = req.body;
+    const id = identityOf(req);
+    const identifier = id.identifier;
+    const email = id.email;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
     if (email && name) {
       await dbq(
         'INSERT INTO users (phone, email, name) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET email = $2, name = $3',
@@ -544,18 +985,18 @@ app.post('/register', async (req, res) => {
     }
     res.json({ phone: row.phone || identifier, subscribed: row.subscribed || false });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
 // Returns the stored profile name for an identifier (phone or email) so the
 // app can restore a previously-chosen nickname after a reinstall / on a new
 // device — an existing user must never be re-asked for a nickname.
-app.get('/user/profile', async (req, res) => {
+app.get('/user/profile', requireAuth, async (req, res) => {
   try {
-    const { phone, email } = req.query;
-    const identifier = phone || email;
-    if (!identifier) return res.status(400).json({ error: 'Phone or email required' });
+    // Query params are ignored: the profile returned is always the caller's.
+    const identifier = identityOf(req).identifier;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
     // Firestore first (the DB-less deployment's source of truth): the
     // /register mirror writes userIndex/{identifier}.name so a nickname is
     // never lost after reinstall. Falls back to Postgres when absent.
@@ -575,7 +1016,7 @@ app.get('/user/profile', async (req, res) => {
     }
     res.json({ name });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -618,29 +1059,46 @@ async function getOrCreateReferralCode(identifier) {
   return code;
 }
 
-app.post('/referral/generate', async (req, res) => {
+app.post('/referral/generate', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone required' });
-    res.json({ referral_code: await getOrCreateReferralCode(phone) });
+    // A referral code belongs to the caller — the body's phone is ignored.
+    const identifier = identityOf(req).identifier;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
+    res.json({ referral_code: await getOrCreateReferralCode(identifier) });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.get('/referral/my-code/:phone', async (req, res) => {
+// Phase 2: the identifier is out of the URL. The old path still answers (its
+// param is ignored) so already-installed app versions keep working, but the
+// code returned is always the token owner's.
+app.get('/referral/my-code/:phone', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.params;
-    if (!phone) return res.status(400).json({ error: 'Phone required' });
-    res.json({ referral_code: await getOrCreateReferralCode(phone) });
+    const identifier = identityOf(req).identifier;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
+    res.json({ referral_code: await getOrCreateReferralCode(identifier) });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.post('/referral/apply', async (req, res) => {
+app.get('/me/referral-code', requireAuth, async (req, res) => {
   try {
-    const { phone, code } = req.body;
+    const identifier = identityOf(req).identifier;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
+    res.json({ referral_code: await getOrCreateReferralCode(identifier) });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+app.post('/referral/apply', requireAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    // The reward is applied to the signed-in account, never to a phone/email
+    // the client claims.
+    const phone = identityOf(req).identifier;
     if (!phone || !code) return res.status(400).json({ error: 'Phone and code required' });
     const upper = code.toUpperCase();
     let referrerPhone = null;
@@ -682,17 +1140,19 @@ app.post('/referral/apply', async (req, res) => {
     }
     res.json({ subscribed: true, referrer: referrerPhone || 'referred' });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.get('/meals/:phone', async (req, res) => {
+app.get('/meals/:phone', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.params;
+    // Legacy route: the path identifier is ignored, so a valid token can only
+    // ever read its OWN meals.
+    const phone = identityOf(req).identifier;
     const result = await dbq('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
     res.json(result.rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -700,19 +1160,21 @@ app.get('/meals/:phone', async (req, res) => {
 // The app's MealSyncService always used GET /meals/list/:phone and
 // POST /meals/remove, which never existed on the server (restore and delete
 // were silently 404ing). These mirror the Postgres + Firestore behaviour.
-app.get('/meals/list/:phone', async (req, res) => {
+app.get('/meals/list/:phone', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.params;
+    // Legacy route — identity comes from the token, not the path.
+    const phone = identityOf(req).identifier;
     const result = await dbq('SELECT * FROM meals WHERE phone = $1 ORDER BY date DESC', [phone]);
     res.json(result.rows);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.post('/meals/remove', async (req, res) => {
+app.post('/meals/remove', requireAuth, async (req, res) => {
   try {
-    const { phone, meal_id } = req.body;
+    const { meal_id } = req.body;
+    const phone = identityOf(req).identifier;
     if (!phone || !meal_id) return res.status(400).json({ error: 'Phone and meal_id required' });
     await dbq('DELETE FROM meals WHERE id = $1 AND phone = $2', [meal_id, phone]);
     // Firestore mirror (best-effort)
@@ -722,13 +1184,14 @@ app.post('/meals/remove', async (req, res) => {
     }
     res.json({ removed: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.post('/meals/sync', async (req, res) => {
+app.post('/meals/sync', requireAuth, async (req, res) => {
   try {
-    const { phone, meals, meal } = req.body;
+    const { meals, meal } = req.body;
+    const phone = identityOf(req).identifier;
     // The app's single-meal sync posts { phone, meal }; the bulk path posts
     // { phone, meals: [...] }. Accept both so Firestore mirrors real traffic.
     const mealList = Array.isArray(meals) ? meals : (meal ? [meal] : null);
@@ -782,7 +1245,7 @@ app.post('/meals/sync', async (req, res) => {
     }
     res.json({ synced: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -791,9 +1254,10 @@ app.post('/meals/sync', async (req, res) => {
 // restore them after a reinstall. The Flutter app's MealSyncService hits
 // /habits/sync and /habits/list/:phone — these were MISSING, which is why
 // synced habits never came back after reinstalling the app.
-app.post('/habits/sync', async (req, res) => {
+app.post('/habits/sync', requireAuth, async (req, res) => {
   try {
-    const { phone, habits, water_log, water_goal } = req.body;
+    const { habits, water_log, water_goal } = req.body;
+    const phone = identityOf(req).identifier;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
     if (!Array.isArray(habits)) return res.status(400).json({ error: 'habits must be an array' });
     await dbq(
@@ -822,13 +1286,14 @@ app.post('/habits/sync', async (req, res) => {
     }
     res.json({ synced: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.get('/habits/list/:phone', async (req, res) => {
+app.get('/habits/list/:phone', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.params;
+    // Legacy route — identity comes from the token, not the path.
+    const phone = identityOf(req).identifier;
     const result = await dbq(
       'SELECT habits, water_log, water_goal FROM habit_data WHERE phone = $1',
       [phone]
@@ -843,14 +1308,15 @@ app.get('/habits/list/:phone', async (req, res) => {
       water_goal: row.water_goal || 8,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.post('/subscribe', async (req, res) => {
+// Legacy admin/test hook: only ever flips the CALLER's own subscription.
+app.post('/subscribe', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    const phone = identityOf(req).identifier;
+    if (!phone) return res.status(400).json({ error: 'Identity required' });
     await dbq('INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true', [phone]);
     // Firestore mirror (best-effort).
     {
@@ -859,14 +1325,14 @@ app.post('/subscribe', async (req, res) => {
     }
     res.json({ subscribed: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.post('/unsubscribe', async (req, res) => {
+app.post('/unsubscribe', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    const phone = identityOf(req).identifier;
+    if (!phone) return res.status(400).json({ error: 'Identity required' });
     await dbq('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
     // Firestore mirror (best-effort).
     {
@@ -875,7 +1341,7 @@ app.post('/unsubscribe', async (req, res) => {
     }
     res.json({ subscribed: false });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -898,10 +1364,15 @@ function normalizeContact(phone) {
   return undefined;
 }
 
-app.post('/payment/create-subscription', async (req, res) => {
+app.post('/payment/create-subscription', requireAuth, async (req, res) => {
   try {
-    const { phone, name, email } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    // The subscription is created for the TOKEN's user: a client-sent phone
+    // would otherwise let anyone attach a payment to someone else's account.
+    const id = identityOf(req);
+    const phone = id.identifier;
+    const name = typeof req.body.name === 'string' ? req.body.name : '';
+    const email = id.email;
+    if (!phone) return res.status(400).json({ error: 'Identity required' });
     if (!process.env.RAZORPAY_KEY_ID) {
       return res.status(500).json({ error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env' });
     }
@@ -973,7 +1444,7 @@ app.post('/payment/create-subscription', async (req, res) => {
       razorpay_key: process.env.RAZORPAY_KEY_ID,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -982,7 +1453,7 @@ app.post('/payment/create-subscription', async (req, res) => {
 // subscription flow. Signature format differs:
 //   order:        HMAC(order_id|payment_id)
 //   subscription: HMAC(subscription_id|payment_id)
-app.post('/payment/verify', async (req, res) => {
+app.post('/payment/verify', requireAuth, async (req, res) => {
   try {
     const {
       razorpay_order_id,
@@ -1022,6 +1493,14 @@ app.post('/payment/verify', async (req, res) => {
     if (!phone) {
       console.error('Could not determine phone from payment notes', { payment_id: razorpay_payment_id });
       return res.status(400).json({ error: 'Could not identify user for this payment' });
+    }
+
+    // The subscription was created for a specific account; only that account
+    // may verify it. (notes.phone comes from Razorpay, written by
+    // create-subscription from the verified token — not from this request.)
+    const id = identityOf(req);
+    if (id.identifier && phone !== id.identifier) {
+      return res.status(403).json({ error: 'Payment does not belong to this account' });
     }
 
     // Store payment in database
@@ -1079,7 +1558,7 @@ app.post('/payment/verify', async (req, res) => {
     }
     res.json({ success: true, subscribed: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -1233,15 +1712,16 @@ app.post('/payment/webhook', async (req, res) => {
 
     res.json({ received: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
 
 
-app.get('/payment/status/:phone', async (req, res) => {
+async function paymentStatusHandler(req, res) {
   try {
-    const { phone } = req.params;
+    // Identity from the token — the URL no longer carries an identifier.
+    const phone = identityOf(req).identifier;
     // Firestore first (DB-less deployment's source of truth), Postgres
     // fallback — same pattern as /subscription/status.
     let subscribed = false;
@@ -1283,7 +1763,26 @@ app.get('/payment/status/:phone', async (req, res) => {
     }
     res.json({ subscribed, payment });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
+  }
+}
+
+// Phase 2: the user's own payment status, identified by the token alone. The
+// legacy path still answers (its param is ignored) for installed versions.
+app.get('/me/payment/status', requireAuth, paymentStatusHandler);
+app.get('/payment/status/:phone', requireAuth, paymentStatusHandler);
+
+// Everything the app needs to show the free-scan allowance: the server is
+// the authority, the app's local counter is only a display estimate.
+// `scans_limit`/`scans_remaining` are null for Pro/admin (no limit), and
+// `reset_at` is the next IST midnight (the daily reset) as a UTC ISO string.
+app.get('/me/entitlements', requireAuth, async (req, res) => {
+  try {
+    const id = identityOf(req);
+    if (!id.identifier && !id.uid) return res.status(400).json({ error: 'Identity required' });
+    res.json(await entitlementsFor(id));
+  } catch (e) {
+    return sendFailure(req, res, e);
   }
 });
 
@@ -1291,17 +1790,131 @@ app.get('/payment/status/:phone', async (req, res) => {
 // Grants or reports the one-time 30-day free plan. Called by the app at
 // startup and after login — that is also what hands existing users their
 // trial after an app update.
-app.get('/trial/status', async (req, res) => {
+app.get('/trial/status', requireAuth, async (req, res) => {
   try {
-    const { phone, email } = req.query;
-    const identifier = phone || email;
-    if (!identifier) return res.status(400).json({ error: 'Phone or email required' });
-    if (isAdminUser(identifier)) return res.json({ admin: true, active: false, daysLeft: 0 });
+    // Query params are ignored — the trial reported is always the caller's.
+    const id = identityOf(req);
+    const identifier = id.identifier;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
+    if (isAdminUser(identifier, id.emailVerified)) return res.json({ admin: true, active: false, daysLeft: 0 });
     const startedAt = await getOrGrantTrial(identifier);
     if (!startedAt) return res.json({ active: false, expired: false, daysLeft: 0 });
     res.json(trialState(startedAt));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
+  }
+});
+
+// In-app self-service account deletion.
+//
+// Wipes ALL of the user's data (Postgres + Firestore) but keeps a tombstone
+// that remembers the identifier (phone/email) AND the original trial start.
+// That tombstone is what prevents a delete -> re-login -> fresh free-trial
+// loop: getOrGrantTrial() checks it first and never re-grants. The user can
+// sign up again with the same phone/email, but they will NOT get another
+// free trial.
+app.post('/account/delete', requireAuth, async (req, res) => {
+  try {
+    // You can only delete the account you are signed in as.
+    const id = identityOf(req);
+    const phone = id.phone || id.identifier;
+    const email = id.email;
+    const identifier = phone || email;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
+    if (isAdminUser(identifier, id.emailVerified)) return res.status(403).json({ error: 'Admin account cannot be deleted' });
+
+    // 1) Capture the original trial start BEFORE wiping anything.
+    let trialStartedAt = null;
+    const fUid = await firestore.resolveUid(identifier);
+    if (fUid && firestore.isEnabled()) {
+      try {
+        const doc = await firestore.getDb().collection('users').doc(fUid).get();
+        trialStartedAt = doc.exists ? (doc.data().trial_started_at || null) : null;
+      } catch (_) {}
+    }
+    if (!trialStartedAt && dbAvailable) {
+      try {
+        const r = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
+        trialStartedAt = (r.rows[0] && r.rows[0].trial_started_at) || null;
+      } catch (_) {}
+    }
+
+    // 2) Write the tombstone — remember the mail/phone so the free trial can
+    //    never be claimed again by this identity. This is NEVER deleted.
+    if (firestore.isEnabled()) {
+      await firestore.set('deletedAccounts/' + String(identifier).toLowerCase(), {
+        identifier,
+        phone: phone || null,
+        email: email || null,
+        trial_started_at: trialStartedAt,
+        deleted_at: new Date().toISOString(),
+      });
+    }
+    if (dbAvailable) {
+      try {
+        await dbq(
+          `INSERT INTO deleted_accounts (identifier, phone, email, trial_started_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (identifier) DO UPDATE SET
+             phone = COALESCE(EXCLUDED.phone, deleted_accounts.phone),
+             email = COALESCE(EXCLUDED.email, deleted_accounts.email),
+             trial_started_at = COALESCE(deleted_accounts.trial_started_at, EXCLUDED.trial_started_at),
+             deleted_at = NOW()`,
+          [identifier, phone || null, email || null, trialStartedAt]
+        );
+      } catch (_) {}
+    }
+
+    // 3) Wipe personal data — Postgres.
+    if (dbAvailable) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM meals WHERE phone = $1', [identifier]);
+        await client.query('DELETE FROM habit_data WHERE phone = $1', [identifier]);
+        await client.query('DELETE FROM subscriptions WHERE phone = $1', [identifier]);
+        await client.query('DELETE FROM payments WHERE phone = $1', [identifier]);
+        await client.query('DELETE FROM users WHERE phone = $1 OR email = $1', [identifier]);
+        await client.query('COMMIT');
+      } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        throw e;
+      } finally {
+        client.release();
+      }
+    }
+
+    // 4) Wipe personal data — Firestore (best-effort). users/{uid} goes too:
+    //    its trial marker now lives on in the tombstone.
+    if (fUid && firestore.isEnabled()) {
+      const db = firestore.getDb();
+      for (const col of ['habitData', 'dietProfiles', 'recentFoods', 'userPreferences', 'recipes']) {
+        await firestore.del(col + '/' + fUid);
+      }
+      // meals where uid matches (docs keyed by meal id)
+      try {
+        const snap = await db.collection('meals').where('uid', '==', fUid).get();
+        const batch = db.batch();
+        snap.docs.forEach((d) => batch.delete(d.ref));
+        if (snap.docs.length > 0) await batch.commit();
+      } catch (_) {}
+      // money records keyed by uid
+      for (const col of ['subscriptions', 'payments']) {
+        try {
+          const snap = await db.collection(col).where('uid', '==', fUid).get();
+          const batch = db.batch();
+          snap.docs.forEach((d) => batch.delete(d.ref));
+          if (snap.docs.length > 0) await batch.commit();
+        } catch (_) {}
+      }
+      // identifier -> uid index + the profile doc itself
+      await firestore.del('userIndex/' + identifier);
+      await firestore.del('users/' + fUid);
+    }
+
+    res.json({ ok: true, trialPreserved: !!trialStartedAt });
+  } catch (e) {
+    return sendFailure(req, res, e);
   }
 });
 
@@ -1313,17 +1926,138 @@ const CHAT_SYSTEM_PROMPT =
   'Answer ONLY questions about food, nutrition and protein: calories, macros (protein, carbs, fat), ' +
   'vitamins, minerals, hydration, ingredients, recipes, Indian and global dishes, veg and non-veg meal ideas, ' +
   'meal planning, portion sizes, and food-related fitness nutrition. ' +
+  'When the user asks about their OWN day (intake so far, remaining calories or protein, whether their targets are met, their habits or water), answer from the USER DATA SNAPSHOT appended below when one is provided, using only the numbers it contains. ' +
   'If (and only if) the question is NOT about food, nutrition or protein, reply exactly once with: ' +
   '\u201CI can only help with food, nutrition and protein questions \u2014 ask me anything about what to eat!\u201D ' +
   'and suggest one example of a food question. Never answer unrelated topics (code, news, politics, personal advice, medical diagnoses). ' +
   'Keep answers under 120 words, friendly and practical. When you name a traditional Indian dish, add a short English explanation in parentheses.';
 
-app.post('/chat', async (req, res) => {
+// Renders the app-supplied snapshot of the user's OWN day (meals, macro
+// totals, targets, habits, water) into a compact block appended to Guru's
+// system instruction. It is untrusted client input: strings are collapsed to
+// a single line and clipped, numbers are coerced and clamped, lists are
+// capped — so a buggy or hostile client can neither smuggle in fresh
+// instructions (a value containing newlines would otherwise read as new
+// prompt lines) nor inflate the prompt.
+const GURU_LIMITS = { label: 40, meal: 60, habit: 40, meals: 12, habits: 8 };
+
+function guruStr(v, max) {
+  if (typeof v !== 'string') return '';
+  return v.replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function guruNum(v, min, max) {
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(Math.max(n, min), max);
+}
+
+function guruNum1(v, min, max) {
+  const n = guruNum(v, min, max);
+  return n == null ? null : Math.round(n * 10) / 10;
+}
+
+function guruMacroLine(prefix, src) {
+  if (!src || typeof src !== 'object') return null;
+  const c = guruNum(src.calories, 0, 100000);
+  const p = guruNum1(src.protein_g, 0, 5000);
+  const cb = guruNum1(src.carbs_g, 0, 5000);
+  const f = guruNum1(src.fats_g, 0, 5000);
+  const bits = [];
+  if (c != null) bits.push(`${Math.round(c)} kcal`);
+  if (p != null) bits.push(`${p}g protein`);
+  if (cb != null) bits.push(`${cb}g carbs`);
+  if (f != null) bits.push(`${f}g fat`);
+  return bits.length ? `${prefix}: ${bits.join(', ')}` : null;
+}
+
+function guruContextBlock(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '';
+  const lines = [];
+
+  const name = guruStr(raw.name, GURU_LIMITS.label);
+  if (name) lines.push(`Name: ${name}`);
+
+  const profileBits = [];
+  const goal = guruStr(raw.goal, GURU_LIMITS.label);
+  const diet = guruStr(raw.diet, GURU_LIMITS.label);
+  if (goal) profileBits.push(`goal ${goal}`);
+  if (diet) profileBits.push(`diet ${diet}`);
+  if (profileBits.length) lines.push(`Profile: ${profileBits.join(', ')}`);
+
+  const targets = guruMacroLine('Daily targets', raw.targets);
+  if (targets) lines.push(targets);
+
+  const eaten = guruMacroLine('Eaten today', raw.today);
+  if (eaten) lines.push(eaten);
+
+  const today = raw.today && typeof raw.today === 'object' ? raw.today : null;
+  const meals = today && Array.isArray(today.meals)
+    ? today.meals.slice(0, GURU_LIMITS.meals)
+    : [];
+  const mealBits = [];
+  for (const m of meals) {
+    if (!m || typeof m !== 'object') continue;
+    const mn = guruStr(m.name, GURU_LIMITS.meal);
+    if (!mn) continue;
+    const mc = guruNum(m.calories, 0, 20000);
+    const mp = guruNum1(m.protein_g, 0, 1000);
+    const extras = [];
+    if (mc != null) extras.push(`${Math.round(mc)} kcal`);
+    if (mp != null) extras.push(`${mp}g protein`);
+    mealBits.push(extras.length ? `${mn} (${extras.join(', ')})` : mn);
+  }
+  if (mealBits.length) lines.push(`Meals logged today: ${mealBits.join('; ')}`);
+
+  const habits = raw.habits && typeof raw.habits === 'object' ? raw.habits : null;
+  if (habits) {
+    const due = guruNum(habits.due, 0, 500);
+    const done = guruNum(habits.completed, 0, 500);
+    const names = (Array.isArray(habits.names) ? habits.names : [])
+      .slice(0, GURU_LIMITS.habits)
+      .map((h) => guruStr(h, GURU_LIMITS.habit))
+      .filter(Boolean);
+    const bits = [];
+    if (done != null && due != null) bits.push(`${done} of ${due} due habits done`);
+    if (names.length) bits.push(`habits: ${names.join(', ')}`);
+    if (bits.length) lines.push(`Habits: ${bits.join(' — ')}`);
+  }
+
+  const water = raw.water && typeof raw.water === 'object' ? raw.water : null;
+  if (water) {
+    const drunk = guruNum(water.glasses, 0, 100);
+    const goalGlasses = guruNum(water.goal, 0, 100);
+    if (drunk != null && goalGlasses != null) {
+      lines.push(`Water today: ${Math.round(drunk)} of ${Math.round(goalGlasses)} glasses`);
+    }
+  }
+
+  if (!lines.length) return '';
+  return '\n\nUSER DATA SNAPSHOT (app-provided, for this signed-in user only; use it to answer their own intake, target, habit and water questions and never invent values that are not in it):\n' +
+    lines.map((l) => `- ${l}`).join('\n') +
+    '\nUse the snapshot ONLY for this user\u2019s own food, nutrition, habit and water questions. If it does not cover what they asked, say you cannot see that yet and suggest they log it. All other restrictions still apply.';
+}
+
+app.post('/chat', requireAuth, rateLimit('/chat'), async (req, res) => {
   try {
-    const { message, history } = req.body || {};
+    const { message, history, context } = req.body || {};
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'message required' });
     }
+
+    // Guru is a PRO feature. Every chat turn is billed to us through Gemini,
+    // so it is gated on the same entitlements the scans use (paid OR the
+    // one-time 30-day free plan OR the owner account). The app mirrors this
+    // by only opening the assistant for Pro users, but the check lives here
+    // because the client is not the authority.
+    const ent = await entitlementsFor(identityOf(req));
+    if (!ent.subscribed) {
+      return res.status(403).json({
+        error: 'pro_required',
+        message: 'Guru is a Pro feature. Upgrade to keep chatting.',
+      });
+    }
+
     const userMsg = message.trim().slice(0, 2000);
     const turns = (Array.isArray(history) ? history : [])
       .slice(-10)
@@ -1331,14 +2065,9 @@ app.post('/chat', async (req, res) => {
       .map((t) => ({ role: t.role, parts: [{ text: String(t.text).slice(0, 500) }] }));
     turns.push({ role: 'user', parts: [{ text: userMsg }] });
 
-    const key = process.env.GEMINI_KEY;
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
-        contents: turns,
-      }),
+    const resp = await geminiGenerate({
+      systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT + guruContextBlock(context) }] },
+      contents: turns,
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
@@ -1346,18 +2075,21 @@ app.post('/chat', async (req, res) => {
     if (!text) throw new Error('Empty response from AI');
     res.json({ reply: text.slice(0, 2000) });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
-app.get('/subscription/status', async (req, res) => {
+app.get('/subscription/status', requireAuth, async (req, res) => {
   try {
-    const { phone, email } = req.query;
-    if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
+    // Identity from the token; query params are ignored.
+    const id = identityOf(req);
+    const phone = id.phone || id.identifier;
+    const email = id.email;
+    if (!phone && !email) return res.status(400).json({ error: 'Identity required' });
     const identifier = phone || email;
 
     // The owner is always subscribed.
-    if (isAdminUser(identifier)) return res.json({ subscribed: true });
+    if (isAdminUser(identifier, id.emailVerified)) return res.json({ subscribed: true });
 
     // Firestore is the source of truth (Phase 3) — check users/{uid} first.
     const fUid = await firestore.resolveUid(identifier);
@@ -1390,7 +2122,7 @@ app.get('/subscription/status', async (req, res) => {
     if (ts.active) return res.json({ subscribed: true, trial_days_left: ts.daysLeft, trial_ends_at: ts.endsAt });
     res.json({ subscribed: false });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return sendFailure(req, res, e);
   }
 });
 
@@ -1398,7 +2130,18 @@ app.get('/subscription/status', async (req, res) => {
 // Railway runs call listen() directly.
 if (require.main === module) {
   const port = process.env.PORT || 3000;
+  // Say which model is actually in use. A wrong or unavailable Gemini model
+  // shows up as a generic 500 on /analyze and /chat, so naming it here turns a
+  // opaque failure into an obvious one at the first log line of a boot.
+  console.log(
+    `Gemini model in use: ${GEMINI_API_VERSION}/models/${GEMINI_MODEL} ` +
+      '(override with GEMINI_MODEL / GEMINI_API_VERSION)'
+  );
   app.listen(port, () => console.log(`MacroSnap server on port ${port}`));
 }
 
 module.exports = app;
+// Exposed so the test harness can reset the per-user rate-limit counters
+// between tests (they live in module scope and would otherwise carry over).
+module.exports._resetRateLimits = resetRateLimits;
+module.exports._rateLimits = RATE_WINDOWS;

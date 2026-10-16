@@ -160,12 +160,43 @@ beforeEach(resetState);
 function sign(body, secret = process.env.RAZORPAY_WEBHOOK_SECRET) {
   return crypto.createHmac('sha256', secret).update(JSON.stringify(body)).digest('hex');
 }
-function makeReq(body, { sig, query } = {}) {
-  const req = { body, query: query || {} };
+// Every protected route now takes its identity from the verified Firebase ID
+// token (auth.js sets req.user) and IGNORES any phone/email/uid in the request.
+// This harness stands in for that middleware, deriving the same identity from
+// the identifier each existing test already passes, so these tests keep
+// covering handler logic. The middleware itself — missing/invalid tokens, the
+// 401s and the "client identifiers are ignored" rule — is covered by
+// test/auth.test.js.
+function actAs(req, identifier) {
+  req.user = identifier
+    ? {
+        uid:
+          uidMap[String(identifier).toLowerCase()] ||
+          'uid_' + String(identifier).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 16),
+        email: String(identifier).includes('@')
+          ? String(identifier).toLowerCase()
+          : undefined,
+        // Google sign-in always arrives verified; phone/uid-only identities
+        // carry no email claim, so they read as unverified. The admin Pro
+        // override requires this flag (see isAdminUser).
+        email_verified: String(identifier).includes('@'),
+        phone_number: String(identifier).includes('@') ? undefined : String(identifier),
+      }
+    : null;
+  return req;
+}
+// `as` forces the TOKEN's identity (independently of what the body claims) —
+// that is how the "client-sent identifiers are ignored" cases are written.
+function makeReq(body, { sig, query, as } = {}) {
+  const req = { body: body || {}, query: query || {} };
   req.headers = {};
   if (sig !== undefined) req.headers['x-razorpay-signature'] = sig;
   req.rawBody = Buffer.from(JSON.stringify(body));
-  return req;
+  const b = req.body;
+  const q = req.query;
+  const identifier =
+    as !== undefined ? as : b.phone || b.email || q.phone || q.email || null;
+  return actAs(req, identifier);
 }
 function makeRes() {
   const res = { statusCode: 200, body: undefined };
@@ -277,29 +308,46 @@ test('webhook: non-state events are logged as ignored', async () => {
 });
 
 // ── create-subscription ─────────────────────────────────────────────────
-test('create-subscription: attaches a customer (email/phone prefill), no customer block, no max_retries, mapping mirrored', async () => {
-  uidMap['+919876543210'] = 'uid_phone';
+test('create-subscription: the TOKEN identity is used — a client-sent phone/email is ignored', async () => {
+  uidMap['spandana@example.com'] = 'uid_email';
   const res = makeRes();
   await createSubscription(makeReq({
+    // Any caller could put ANY identifier here; neither may be trusted.
     phone: '+919876543210',
     name: 'Spandana',
-    email: 'spandana@example.com',
-  }), res);
+    email: 'attacker@example.com',
+  }, { as: 'spandana@example.com' }), res);
+
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.subscription_id, 'sub_test_1');
   assert.equal(res.body.razorpay_key, 'rzp_test_key');
   assert.equal(razorpayState.lastCreate.total_count, 12);
-  assert.equal(razorpayState.lastCreate.notes.phone, '+919876543210');
-  // customer created with the user's real identity and attached via customer_id
+  // The subscription is mapped to the signed-in user, not to the body's phone.
+  assert.equal(razorpayState.lastCreate.notes.phone, 'spandana@example.com');
   assert.equal(razorpayState.lastCustomer.name, 'Spandana');
-  assert.equal(razorpayState.lastCustomer.email, 'spandana@example.com');
-  assert.equal(razorpayState.lastCustomer.contact, '+919876543210');
+  assert.equal(razorpayState.lastCustomer.email, 'spandana@example.com',
+    'the customer email comes from the verified token');
+  assert.ok(!('contact' in razorpayState.lastCustomer), 'no contact for an email identity');
   assert.equal(razorpayState.lastCustomer.fail_existing, 0);
   assert.equal(razorpayState.lastCreate.customer_id, 'cust_test_1');
   assert.ok(!('customer' in razorpayState.lastCreate), 'customer block must never be sent');
   assert.ok(!('max_retries' in razorpayState.lastCreate), 'max_retries must never be sent');
   const mapping = lastFsSet((s) => s.path === 'subscriptions/sub_test_1');
-  assert.equal(mapping.data.phone, '+919876543210');
+  assert.equal(mapping.data.phone, 'spandana@example.com');
+  assert.ok(
+    !JSON.stringify(fsSets).includes('+919876543210'),
+    'the body-supplied phone must never reach a stored record'
+  );
+});
+
+test('create-subscription: a phone identity prefills the customer contact', async () => {
+  uidMap['+919876543210'] = 'uid_phone';
+  const res = makeRes();
+  await createSubscription(makeReq({ phone: '+919876543210', name: 'Spandana' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(razorpayState.lastCreate.notes.phone, '+919876543210');
+  assert.equal(razorpayState.lastCustomer.contact, '+919876543210');
+  assert.equal(lastFsSet((s) => s.path === 'subscriptions/sub_test_1').data.phone, '+919876543210');
 });
 
 test('create-subscription: email login → customer has email, no contact (page asks only for mobile)', async () => {
@@ -327,21 +375,36 @@ test('create-subscription: customer prefill failure never blocks the subscriptio
   assert.ok(!('customer_id' in razorpayState.lastCreate), 'subscription proceeds without a customer');
 });
 
-test('create-subscription: rejects when Razorpay rejects the payload (keeps the error visible)', async () => {
+test('create-subscription: Razorpay rejection → generic 500, internals logged not leaked', async () => {
   razorpayState.subscriptionsCreate = async () => {
     throw new Error('max_retries is/are not required and should not be sent');
   };
-  const res = makeRes();
-  await createSubscription(makeReq({ phone: '+919876543210' }), res);
-  assert.equal(res.statusCode, 500);
-  assert.match(res.body.error, /max_retries/);
+  // A third-party error string is not ours to show: Razorpay's internals
+  // must stay in the server log while the client gets a generic failure.
+  // (This test previously asserted the opposite — that the raw text was
+  // echoed back — which is the leak this guards against.)
+  const logged = [];
+  const realError = console.error;
+  console.error = (...args) => { logged.push(args.join(' ')); };
+  let res;
+  try {
+    res = makeRes();
+    await createSubscription(makeReq({ phone: '+919876543210' }), res);
+  } finally {
+    console.error = realError;
+  }
+  assert.equal(res.statusCode, 500, 'the failure must still surface as a 500');
+  assert.match(res.body.error, /Something went wrong/, 'client sees a generic message');
+  assert.ok(!/max_retries/.test(res.body.error), 'Razorpay internals must NOT reach the client');
+  assert.ok(logged.some((l) => l.includes('max_retries')), 'the real error must be logged server-side');
 });
 
-test('create-subscription: missing phone → 400', async () => {
+test('create-subscription: no verifiable identity → 400, no payment is created', async () => {
   const res = makeRes();
-  await createSubscription(makeReq({}), res);
+  await createSubscription(makeReq({ phone: '+919876543210' }, { as: null }), res);
   assert.equal(res.statusCode, 400);
-  assert.equal(res.body.error, 'Phone required');
+  assert.equal(res.body.error, 'Identity required');
+  assert.equal(razorpayState.lastCreate, null, 'nothing may be created without an identity');
 });
 
 // ── verify: subscription signature order ────────────────────────────────

@@ -24,13 +24,27 @@ function multer() { return { single: () => (req, res, next) => next() }; }
 multer.memoryStorage = () => ({});
 const pgStub = { Pool: class { query() { return { rows: [] }; } } };
 const sharpStub = (buf) => ({ jpeg: () => ({ toBuffer: async () => buf }) });
+// /generate-diet-plan is Pro-only, so the harness has to be able to produce a
+// SUBSCRIBED user. entitlementsFor reads Firestore users/{uid}.subscribed, so
+// the stub reports exactly that for the uids in `subscribedUids` (and an empty
+// doc for everyone else, i.e. a free user).
+const subscribedUids = new Set(['uidPro']);
 const firestoreStub = {
   init: () => true,
-  isEnabled: () => false,
+  isEnabled: () => true,
   resolveUid: async () => null,
   set: async () => true,
   del: async () => true,
-  getDb: () => ({ collection: () => ({ doc: () => ({ get: async () => ({ exists: false, data: () => ({}) }) }) }) }),
+  getDb: () => ({
+    collection: () => ({
+      doc: (id) => ({
+        get: async () => {
+          const subscribed = subscribedUids.has(id);
+          return { exists: subscribed, data: () => (subscribed ? { subscribed: true } : {}) };
+        },
+      }),
+    }),
+  }),
 };
 
 const origLoad = Module._load;
@@ -82,7 +96,13 @@ const meatPlan = JSON.parse(JSON.stringify(vegPlan));
 meatPlan.meals[1].description = '1 cup chicken breast curry (150g chicken) with rice';
 meatPlan.tips = ['Swap paneer for chicken to hit protein faster'];
 
-function makeReq(body) { return { body }; }
+// Stands in for requireAuth: auth.js reads the caller's identity from
+// `req.user`, so the harness sets verified claims directly. `user` defaults to
+// a paying subscriber so the prompt tests below exercise the real path; the
+// free-user 403 has its own test.
+const PRO_USER = { uid: 'uidPro', email: 'pro@example.com', email_verified: true };
+const FREE_USER = { uid: 'uidFree', email: 'free@example.com', email_verified: true };
+function makeReq(body, user = PRO_USER) { return { body, user }; }
 function makeRes() {
   const res = { statusCode: 200, payload: null };
   res.status = (c) => { res.statusCode = c; return res; };
@@ -150,6 +170,40 @@ test('prompt demands inline plain-English glosses for Indian dish names', async 
   assert.match(gemini.prompts[0], /simple English/);
   assert.match(gemini.prompts[0], /plain-English explanation in parentheses/);
   assert.match(gemini.prompts[0], /right after the term/);
+});
+
+test('a free user gets 403 pro_required and no Gemini call is made', async () => {
+  // The loudest half of the paywall: the app hides the plan builder from a
+  // free user, but the server must refuse even if that is bypassed — every
+  // plan is a Gemini call we pay for.
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(
+    makeReq({ weight: 70, height: 170, age: 25, gender: 'male', goal: 'maintain', activity: 'moderate', diet: 'vegetarian' }, FREE_USER),
+    res
+  );
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.payload.error, 'pro_required');
+  assert.equal(gemini.prompts.length, 0, 'a refused request must not cost a Gemini call');
+});
+
+test('a malformed request is still reported as malformed, not as Pro-gated', async () => {
+  // Input validation runs before the entitlement check, matching /chat.
+  const res = makeRes();
+  await handler(makeReq({ height: 170, age: 25 }, FREE_USER), res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(gemini.prompts.length, 0);
+});
+
+test('a subscribed user is not Pro-gated (the gate is not a blanket refusal)', async () => {
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(
+    makeReq({ weight: 70, height: 170, age: 25, gender: 'male', goal: 'maintain', activity: 'moderate', diet: 'vegetarian' }, PRO_USER),
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(gemini.prompts.length, 1);
 });
 
 test('restored after tests', () => { global.fetch = origFetch; });
