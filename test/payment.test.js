@@ -148,6 +148,9 @@ const verify = routes.post['/payment/verify'];
 const subscriptionStatus = routes.get['/subscription/status'];
 const userProfile = routes.get['/user/profile'];
 const referralGenerate = routes.post['/referral/generate'];
+const paymentStatus = routes.get['/me/payment/status'];
+
+assert.ok(paymentStatus, '/me/payment/status must be registered');
 
 assert.ok(webhook, '/payment/webhook handler must be registered');
 assert.ok(createSubscription, '/payment/create-subscription must be registered');
@@ -485,7 +488,10 @@ test('verify: subscription signature is HMAC(payment_id|subscription_id)', async
   }), res);
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.subscribed, true);
-  assert.equal(lastFsSet((s) => s.path === 'users/uid_pay').data.subscribed, true);
+  const user = lastFsSet((s) => s.path === 'users/uid_pay');
+  assert.equal(user.data.subscribed, true);
+  assert.equal(user.data.intro_used, true,
+    'a verified payment spends the ₹1 intro for this account');
 });
 
 // The activation must use the TOKEN's uid. resolveUid(payment.notes.phone) is
@@ -659,10 +665,94 @@ test('subscription/status: Firestore users doc is authoritative', async () => {
   assert.deepEqual(res.body, { subscribed: true });
 });
 
-test('subscription/status: nothing on record → not subscribed', async () => {
+test('subscription/status: nothing on record → not subscribed, intro still open', async () => {
   const res = makeRes();
   await subscriptionStatus(makeReq({}, { query: { phone: 'nobody@example.com' } }), res);
-  assert.deepEqual(res.body, { subscribed: false });
+  assert.deepEqual(res.body, { subscribed: false, intro_eligible: true });
+});
+
+test('subscription/status: a cancelled ex-subscriber is free but NOT intro-eligible', async () => {
+  uidMap['ex@example.com'] = 'uid_ex';
+  fsDocs.users = { uid_ex: { subscribed: false, intro_used: true } };
+  const res = makeRes();
+  await subscriptionStatus(makeReq({}, { as: 'ex@example.com' }), res);
+  assert.equal(res.body.subscribed, false);
+  assert.equal(res.body.intro_eligible, false,
+    'the ₹1 month was spent — the paywall must not promise it again');
+});
+
+// ── intro offer: ₹1 once per ACCOUNT ─────────────────────────────────────
+// Every subscription app limits its intro price with a durable per-account
+// record (Spotify: never again; YouTube: 6-month window; Apple: one per
+// subscription group). Razorpay has no such check, so ours lives in the
+// users doc and this is what stops cancel → re-subscribe costing ₹1 forever.
+
+test('create-subscription: a returning account pays ₹49 from day one — no ₹1 addon', async () => {
+  uidMap['returner@example.com'] = 'uid_ret';
+  fsDocs.users = { uid_ret: { intro_used: true } };
+  const res = makeRes();
+  await createSubscription(makeReq({}, { as: 'returner@example.com' }), res);
+
+  assert.equal(res.statusCode, 200);
+  const created = razorpayState.lastCreate;
+  assert.ok(!('addons' in created), 'no ₹1 addon for an account that used it');
+  assert.ok(!('start_at' in created), 'the first ₹49 cycle starts immediately');
+  assert.equal(created.plan_id, 'plan_test_1', 'the ₹49 plan still bills');
+  assert.equal(res.body.intro_offer, false);
+  assert.equal(res.body.first_month_price, 4900, 'month one costs ₹49, not ₹1');
+  assert.equal(res.body.first_month_days, 0);
+});
+
+test('create-subscription: a legacy payer (payment record, no flag) does not get ₹1 again', async () => {
+  // Accounts that paid before intro_used existed: their payment record is
+  // the proof, so the flag's absence must not re-open the intro price.
+  uidMap['legacy@example.com'] = 'uid_leg';
+  fsDocs.payments = { pay_old: { identifier: 'legacy@example.com', status: 'approved' } };
+  const res = makeRes();
+  await createSubscription(makeReq({}, { as: 'legacy@example.com' }), res);
+
+  assert.equal(res.statusCode, 200);
+  const created = razorpayState.lastCreate;
+  assert.ok(!('addons' in created), 'a previous payer must never be re-offered ₹1');
+  assert.equal(res.body.intro_offer, false);
+});
+
+test('webhook: the first charge marks the ₹1 intro as used', async () => {
+  uidMap['123spandana88@gmail.com'] = 'uid1';
+  const body = chargedEvent('sub_intro', { phone: '123spandana88@gmail.com' });
+  const res = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), res);
+  assert.equal(res.statusCode, 200);
+  const user = lastFsSet((s) => s.path === 'users/uid1');
+  assert.equal(user.data.intro_used, true,
+    'a successful charge is what spends the intro price');
+});
+
+test('payment/status: intro_eligible is true for an account that never paid', async () => {
+  uidMap['fresh@example.com'] = 'uid_fresh';
+  const res = makeRes();
+  await paymentStatus(makeReq({}, { as: 'fresh@example.com' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.intro_eligible, true);
+  assert.equal(res.body.subscribed, false);
+});
+
+test('payment/status: intro_eligible is false once the intro month was paid', async () => {
+  uidMap['used@example.com'] = 'uid_used';
+  fsDocs.users = { uid_used: { subscribed: false, intro_used: true } };
+  const res = makeRes();
+  await paymentStatus(makeReq({}, { as: 'used@example.com' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.intro_eligible, false);
+});
+
+test('payment/status: any payment record also closes the intro', async () => {
+  uidMap['paid@example.com'] = 'uid_paid';
+  fsDocs.payments = { pay_x: { identifier: 'paid@example.com', status: 'approved' } };
+  const res = makeRes();
+  await paymentStatus(makeReq({}, { as: 'paid@example.com' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.intro_eligible, false);
 });
 
 test('subscription/status: pro_until rides along so the app can show the end date', async () => {

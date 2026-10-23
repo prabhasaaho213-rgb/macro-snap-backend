@@ -385,6 +385,12 @@ async function initDB(retries = 5) {
         // pro_until: a 30-day Pro window (referral reward). A paid subscription
         // sets `subscribed`; a referral only ever sets a date.
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_until TIMESTAMPTZ"); } catch (_) {}
+        // intro_used: this account has already collected the ₹1 first month;
+        // every later subscription bills ₹49 from day one.
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS intro_used BOOLEAN DEFAULT false"); } catch (_) {}
+        // FREE TRIALS ARE GONE: erase every leftover trial marker so no code
+        // path — old or new — can ever reinterpret one as an entitlement.
+        try { await client.query("UPDATE users SET trial_started_at = NULL WHERE trial_started_at IS NOT NULL"); } catch (_) {}
         try { await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_code ON users (referral_code)"); } catch (_) {}
         await client.query(`
           CREATE TABLE IF NOT EXISTS payments (
@@ -531,6 +537,58 @@ app.use((req, res, next) => {
 // authorised by UPI or e-mandate, and most Indian users pay by UPI.
 const FIRST_MONTH_DAYS = 30;
 const FIRST_MONTH_PRICE = 100; // ₹1 in paise
+
+// ── Intro offer eligibility: ₹1 once per ACCOUNT, not once per signup ───
+// Every subscription app that runs an intro price enforces it against a
+// durable record of the person, not their current state: Spotify excludes
+// anyone who ever subscribed, YouTube re-qualifies only after 6 months,
+// Apple allows one intro offer per subscription group. Razorpay offers no
+// such check — nothing stops the same customer creating a new subscription
+// — so the ledger lives here.
+//
+// An account has "used" the ₹1 month when EITHER:
+//   * intro_used was recorded on a previous successful charge, or
+//   * any payment record exists for the identifier (accounts that paid
+//     before this flag existed — the flag is only written from this release
+//     on, and a legacy payer must not be handed ₹1 again).
+//
+// Fail-open: when the stores cannot be read, the intro price is offered
+// rather than withheld — wrongly charging a first-timer ₹49 at checkout
+// (after the app already showed them ₹1) is the worse mismatch, and the
+// abuse costs at most one ₹1 month per incident.
+async function introUsedFor({ uid, identifier }) {
+  if (uid && firestore.isEnabled()) {
+    try {
+      const doc = await firestore.getDb().collection('users').doc(uid).get();
+      if (doc.exists && (doc.data() || {}).intro_used === true) return true;
+    } catch (_) {}
+  }
+  // Payments are only ever written by /payment/verify after a genuine
+  // signature check, so any record here means this identity has paid.
+  if (identifier && firestore.isEnabled()) {
+    try {
+      const snap = await firestore
+        .getDb()
+        .collection('payments')
+        .where('identifier', '==', identifier)
+        .get();
+      if (snap && !snap.empty) return true;
+    } catch (_) {}
+  }
+  if (dbAvailable && identifier) {
+    const u = await dbq(
+      'SELECT intro_used FROM users WHERE phone = $1 OR email = $1 LIMIT 1',
+      [identifier]
+    );
+    if (u.rows[0] && u.rows[0].intro_used) return true;
+    const p = await dbq(
+      "SELECT id FROM payments WHERE phone = $1 AND status = 'approved' LIMIT 1",
+      [identifier]
+    );
+    if (p.rows[0]) return true;
+  }
+  return false;
+}
 
 // A referral grants a 30-DAY Pro WINDOW (`pro_until`), not a permanent
 // `subscribed` flag — an expired referral therefore drops the user back to
@@ -1547,6 +1605,14 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
       });
     }
 
+    // ── ₹1 is the FIRST subscription's price, not a recurring courtesy ──
+    // A cancelled account re-subscribing is an ordinary new subscription for
+    // Razorpay, so nothing there stops the ₹1 from being collected again and
+    // again. Our own ledger decides: an account that has ever paid gets the
+    // ₹49 plan from day one (no addon, no deferred start) — the same rule
+    // Spotify/YouTube/Apple apply to their intro offers.
+    const introUsed = await introUsedFor(id);
+
     const planId = await getPlanId();
 
     // Attach a Razorpay customer so the hosted payment page prefills the
@@ -1572,29 +1638,41 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
     }
 
     const subscription = await razorpay.subscriptions.create({
-      // FIRST MONTH ₹1: billing for the ₹49 plan starts 30 days out, and the
-      // ₹1 is collected NOW as an upfront addon during the authorisation
-      // transaction. That is the difference between this and the old free
-      // month: the customer makes a real (small) payment today, which also
-      // authenticates the mandate without a bare ₹5 token debit. The first
-      // ₹49 charge happens at the start of the future cycle, reported by
-      // subscription.activated / subscription.charged via the webhook below.
-      start_at: Math.floor((Date.now() + FIRST_MONTH_DAYS * 24 * 60 * 60 * 1000) / 1000),
+      // ── NEW accounts: FIRST MONTH ₹1 ────────────────────────────
+      // Billing for the ₹49 plan starts 30 days out, and the ₹1 is collected
+      // NOW as an upfront addon during the authorisation transaction. That is
+      // the difference between this and the old free month: the customer
+      // makes a real (small) payment today, which also authenticates the
+      // mandate without a bare ₹5 token debit. The first ₹49 charge happens
+      // at the start of the future cycle, reported by subscription.activated /
+      // subscription.charged via the webhook below.
+      //
+      // ── RETURNING accounts: ₹49 from day one ────────────────────
+      // No start_at (the first cycle is charged at authorisation) and no
+      // addon — skipping the intro price is what stops cancel → re-subscribe
+      // from costing ₹1 a month forever.
+      ...(introUsed
+        ? {}
+        : {
+            start_at: Math.floor(
+              (Date.now() + FIRST_MONTH_DAYS * 24 * 60 * 60 * 1000) / 1000
+            ),
+            // Razorpay's only cross-method way to take money at authorisation:
+            // `addons` is "the upfront amount you want to collect as part of
+            // the authorisation transaction". Kept separate from the plan so
+            // the recurring amount stays ₹49.
+            addons: [
+              {
+                item: {
+                  name: 'First month',
+                  amount: FIRST_MONTH_PRICE,
+                  currency: 'INR',
+                  description: 'First month at ₹1, then ₹49/month',
+                },
+              },
+            ],
+          }),
       plan_id: planId,
-      // Razorpay's only cross-method way to take money at authorisation:
-      // `addons` is "the upfront amount you want to collect as part of the
-      // authorisation transaction". Kept separate from the plan so the
-      // recurring amount stays ₹49.
-      addons: [
-        {
-          item: {
-            name: 'First month',
-            amount: FIRST_MONTH_PRICE,
-            currency: 'INR',
-            description: 'First month at ₹1, then ₹49/month',
-          },
-        },
-      ],
       // Razorpay stops charging after total_count cycles, so 12 silently
       // ended Pro (and the billing) one year after signup. 100 is Razorpay's
       // own maximum — effectively open-ended — and the webhook still reacts to
@@ -1639,11 +1717,15 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
 
     res.json({
       subscription_id: subscription.id,
-      amount: 4900, // what auto-charges once the ₹1 first month is over
+      amount: 4900, // what auto-charges every cycle for a returning account
       currency: 'INR',
-      // Month 1 costs ₹1 (charged with the mandate), month 2 onwards ₹49.
-      first_month_price: FIRST_MONTH_PRICE,
-      first_month_days: FIRST_MONTH_DAYS,
+      // True when THIS checkout carries the ₹1 intro (first subscription
+      // ever). The app uses it to keep the checkout description honest.
+      intro_offer: !introUsed,
+      // New accounts: month 1 costs ₹1 (charged with the mandate), month 2
+      // onwards ₹49. Returning accounts pay ₹49 from the first cycle.
+      first_month_price: introUsed ? 4900 : FIRST_MONTH_PRICE,
+      first_month_days: introUsed ? 0 : FIRST_MONTH_DAYS,
       first_charge_at:
         subscription.start_at
           ? new Date(subscription.start_at * 1000).toISOString()
@@ -1794,8 +1876,10 @@ app.post('/payment/verify', requireAuth, async (req, res) => {
       if (p._failed) {
         console.error('Payment insert failed for', razorpay_payment_id);
       }
+      // intro_used: a verified payment means the ₹1 intro (if any) is spent;
+      // every later subscription for this account bills ₹49 from day one.
       const u = await dbq(
-        'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true',
+        'INSERT INTO users (phone, subscribed, intro_used) VALUES ($1, true, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true, intro_used = true',
         [phone]
       );
       if (!u._failed) activatedIn = 'postgres';
@@ -1821,7 +1905,13 @@ app.post('/payment/verify', requireAuth, async (req, res) => {
     if (fUid && firestore.isEnabled()) {
       const userDocs = await firestore.set(
         'users/' + fUid,
-        { subscribed: true, subscriptionId: razorpay_subscription_id || null },
+        {
+          subscribed: true,
+          // Marks the ₹1 intro as spent the moment a genuine payment is
+          // verified — the same ledger YouTube/Apple keep per account.
+          intro_used: true,
+          subscriptionId: razorpay_subscription_id || null,
+        },
         { merge: true }
       );
       if (userDocs) activatedIn = 'firestore';
@@ -1967,7 +2057,7 @@ app.post('/payment/webhook', async (req, res) => {
       outcome = 'unresolved';
     } else if (turnOn) {
       await dbq(
-        'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true, subscription_id = $2',
+        'INSERT INTO users (phone, subscribed, intro_used) VALUES ($1, true, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true, intro_used = true, subscription_id = $2',
         [phone, subscriptionId]
       );
       try {
@@ -1977,7 +2067,9 @@ app.post('/payment/webhook', async (req, res) => {
       {
         const fUid = await firestore.resolveUid(phone);
         if (fUid) {
-          await firestore.set('users/' + fUid, { subscribed: true, subscriptionId: subscriptionId || null }, { merge: true });
+          // intro_used rides along on every charge: after the first one the
+          // ₹1 intro is spent, so a later re-subscribe bills ₹49 from day one.
+          await firestore.set('users/' + fUid, { subscribed: true, intro_used: true, subscriptionId: subscriptionId || null }, { merge: true });
         }
         if (subscriptionId) {
           await firestore.set('subscriptions/' + subscriptionId, { uid: fUid || null, identifier: phone, status: sub?.status || 'active', updatedAt: new Date() }, { merge: true });
@@ -2034,11 +2126,18 @@ async function paymentStatusHandler(req, res) {
     // fallback — same pattern as /subscription/status.
     let subscribed = false;
     let payment = null;
+    // Whether the ₹1 intro month is still available to this account — the
+    // paywall shows ₹1 copy only when the server says so, so a re-subscriber
+    // is never promised a price their checkout will not charge.
+    let introUsed = false;
     try {
       const fUid = await firestore.resolveUid(phone);
       if (fUid && firestore.isEnabled()) {
         const doc = await firestore.getDb().collection('users').doc(fUid).get();
-        if (doc.exists) subscribed = doc.data().subscribed === true;
+        if (doc.exists) {
+          subscribed = doc.data().subscribed === true;
+          introUsed = doc.data().intro_used === true;
+        }
         const snap = await firestore
           .getDb()
           .collection('payments')
@@ -2051,6 +2150,8 @@ async function paymentStatusHandler(req, res) {
           if (!newest || t > newest._t) newest = { ...data, _t: t };
         });
         if (newest) {
+          // Any payment record means this identity has paid before.
+          introUsed = true;
           payment = {
             transactionRef: newest.transactionRef || null,
             amount: newest.amount || null,
@@ -2061,15 +2162,17 @@ async function paymentStatusHandler(req, res) {
       }
     } catch (_) {}
     if (!subscribed && !payment) {
-      const user = await dbq('SELECT subscribed FROM users WHERE phone = $1', [phone]);
+      const user = await dbq('SELECT subscribed, intro_used FROM users WHERE phone = $1', [phone]);
       const payments = await dbq(
         'SELECT * FROM payments WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
         [phone]
       );
       subscribed = user.rows[0]?.subscribed || false;
+      introUsed = introUsed || user.rows[0]?.intro_used === true;
       payment = payments.rows[0] || null;
+      if (payment) introUsed = true;
     }
-    res.json({ subscribed, payment });
+    res.json({ subscribed, payment, intro_eligible: !introUsed });
   } catch (e) {
     return sendFailure(req, res, e);
   }
@@ -2238,7 +2341,9 @@ const CHAT_SYSTEM_PROMPT =
   'If (and only if) the question is NOT about food, nutrition or protein, reply exactly once with: ' +
   '\u201CI can only help with food, nutrition and protein questions \u2014 ask me anything about what to eat!\u201D ' +
   'and suggest one example of a food question. Never answer unrelated topics (code, news, politics, personal advice, medical diagnoses). ' +
-  'Keep answers under 120 words, friendly and practical. When you name a traditional Indian dish, add a short English explanation in parentheses.';
+  'Guru\u2019s replies must be SHORT and SCANNABLE: use bullet points (one point per line, starting with a \u2022 or a dash) or a compact numbered list \u2014 never long paragraphs or essays. ' +
+  'Keep the whole answer under 80 words overall, friendly and practical. A one-line answer with 2-4 quick points beats a paragraph. ' +
+  'When you name a traditional Indian dish, add a short English explanation in parentheses.';
 
 // Renders the app-supplied snapshot of the user's OWN day (meals, macro
 // totals, targets, habits, water) into a compact block appended to Guru's
@@ -2401,6 +2506,10 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
     if (isAdminUser(id)) return res.json({ subscribed: true });
 
     // Firestore is the source of truth (Phase 3) — check users/{uid} first.
+    // introUsed rides along so the FREE answer can say whether the ₹1 intro
+    // month is still available (the paywall and upsell teasers only promise
+    // ₹1 when the server says it is real for this account).
+    let introUsed = false;
     const fUid = await firestore.resolveUid(identifier);
     if (fUid && firestore.isEnabled()) {
       try {
@@ -2412,6 +2521,14 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
             ...(doc.data().pro_until ? { pro_until: doc.data().pro_until } : {}),
           });
         }
+        if (doc.exists) introUsed = doc.data().intro_used === true;
+        // Legacy payers predate the flag: their payment record is the proof.
+        const paid = await firestore
+          .getDb()
+          .collection('payments')
+          .where('identifier', '==', identifier)
+          .get();
+        if (paid && !paid.empty) introUsed = true;
         // A referral's 30-day window counts as Pro until pro_until passes.
         if (doc.exists && proUntilActive(doc.data().pro_until)) {
           const proUntil = doc.data().pro_until;
@@ -2431,11 +2548,11 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
     // Postgres fallback (legacy / when Firestore has no user doc).
     let user = null;
     if (phone) {
-      const r = await dbq('SELECT subscribed, pro_until FROM users WHERE phone = $1 LIMIT 1', [phone]);
+      const r = await dbq('SELECT subscribed, pro_until, intro_used FROM users WHERE phone = $1 LIMIT 1', [phone]);
       user = r.rows[0] || null;
     }
     if (!user && email) {
-      const r = await dbq('SELECT subscribed, pro_until FROM users WHERE email = $1 LIMIT 1', [email]);
+      const r = await dbq('SELECT subscribed, pro_until, intro_used FROM users WHERE email = $1 LIMIT 1', [email]);
       user = r.rows[0] || null;
     }
     if (user?.subscribed) {
@@ -2444,8 +2561,16 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
         ...(user.pro_until ? { pro_until: user.pro_until } : {}),
       });
     }
+    if (user && user.intro_used) introUsed = true;
+    if (user && identifier) {
+      const paid = await dbq(
+        "SELECT id FROM payments WHERE phone = $1 AND status = 'approved' LIMIT 1",
+        [identifier]
+      );
+      if (paid.rows[0]) introUsed = true;
+    }
     if (proUntilActive(user && user.pro_until)) return res.json({ subscribed: true, pro_until: user.pro_until });
-    res.json({ subscribed: false });
+    res.json({ subscribed: false, intro_eligible: !introUsed });
   } catch (e) {
     return sendFailure(req, res, e);
   }
