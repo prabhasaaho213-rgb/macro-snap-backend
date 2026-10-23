@@ -7,3 +7,4 @@ test_*.js
 .vercel
 clear_backup_data.py
 cloud_backup_*.json
+.env*

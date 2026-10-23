@@ -1,5 +1,5 @@
 'use strict';
-// 30-day free trial + /chat nutrition-assistant tests. Same zero-dep harness
+// Free-trial REMOVAL + /chat nutrition-assistant tests. Same zero-dep harness
 // as payment.test.js: express and friends are stubbed through Module._load,
 // Firestore is an in-memory fake, and Gemini's HTTP call is a scripted fetch.
 //
@@ -11,6 +11,7 @@ const Module = require('node:module');
 // ── In-memory Firestore fake ────────────────────────────────────────────
 const fsDocs = {}; // collection -> docId -> data
 const fsSets = []; // every firestore.set(path, data, opts) call
+let failSharedTransactions = false;
 const uidMap = { 'u1@test.com': 'uid1', '9999999999': 'uid2' };
 const firestoreStub = {
   init: () => true,
@@ -42,6 +43,7 @@ const firestoreStub = {
     }),
     // Single-doc transaction, matching how /analyze reserves a scan.
     runTransaction: async (fn) => {
+      if (failSharedTransactions) throw new Error('shared store unavailable');
       const tx = {
         get: async (ref) => {
           const d = (fsDocs[ref._col] || {})[ref._id];
@@ -185,52 +187,46 @@ beforeEach(() => {
   fsSets.length = 0;
   gemini.bodies.length = 0;
   gemini.replies.length = 0;
-  // Rate-limit counters live in server module scope, so a test that spends
-  // the allowance must not leak it into the next one.
-  if (typeof app._resetRateLimits === 'function') app._resetRateLimits();
+  failSharedTransactions = false;
 });
 
-test('trial: granted on first check, one time only, for 30 days', async () => {
-  const res1 = makeRes();
-  await trialStatus(makeReq({}, { phone: '9999999999' }), res1);
-  assert.equal(res1.statusCode, 200);
-  assert.equal(res1.payload.active, true);
-  assert.equal(res1.payload.daysLeft, 30, 'a fresh trial lasts 30 days');
-  assert.ok(res1.payload.endsAt, 'expiry date must be reported');
-  assert.equal(fsDocs.users.uid2.trial_started_at != null, true, 'trial start persisted to Firestore');
-
-  const started = fsDocs.users.uid2.trial_started_at;
-  const writesAfterFirst = fsSets.filter((s) => s.data.trial_started_at).length;
-
-  // Second check (same user) must NOT restart or re-grant the trial.
+// ── Trials are gone: /trial/status answers a flat no ─────────────────
+// The ₹49/month subscription (first month ₹0 via deferred billing) replaced
+// the 30-day free trial for EVERYONE except the always-Pro owner account.
+// The endpoint must still answer so older installed app versions receive a
+// clean "no trial" verdict — but it may never grant or extend anything.
+test('trial: the grant is gone — the endpoint reports inactive and writes nothing', async () => {
+  const res = makeRes();
+  await trialStatus(makeReq({}, { phone: '9999999999' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload.active, false, 'no trial is ever minted again');
+  assert.equal(res.payload.daysLeft, 0);
+  assert.equal(
+    fsSets.filter((s) => s.path.startsWith('users/') && s.data.trial_started_at).length,
+    0,
+    'no trial_started_at write may ever happen'
+  );
+  // A second check answers the same flat no — nothing stateful anywhere.
   const res2 = makeRes();
   await trialStatus(makeReq({}, { phone: '9999999999' }), res2);
-  assert.equal(res2.payload.active, true);
-  assert.equal(fsDocs.users.uid2.trial_started_at, started, 'trial start must not change');
-  assert.equal(
-    fsSets.filter((s) => s.data.trial_started_at).length,
-    writesAfterFirst,
-    'no second trial_started_at write ever happens'
-  );
+  assert.equal(res2.payload.active, false);
+  assert.equal(fsSets.length, 0, 'checking twice still writes nothing');
 });
 
-test('trial: expires after 30 days and never comes back', async () => {
-  fsDocs.users = { uid2: { trial_started_at: new Date(Date.now() - 31 * DAY).toISOString() } };
+test('trial: a stale trial_started_at on an old doc grants nothing', async () => {
+  // An old install once received a trial; after the removal the server must
+  // ignore the stored marker instead of honouring or resurrecting it.
+  fsDocs.users = { uid2: { trial_started_at: new Date(Date.now() - 1 * DAY).toISOString() } };
   const res = makeRes();
   await trialStatus(makeReq({}, { phone: '9999999999' }), res);
-  assert.equal(res.payload.active, false);
-  assert.equal(res.payload.expired, true);
+  assert.equal(res.payload.active, false, 'the trial is REMOVED for existing users too');
+  assert.equal(res.payload.expired, false, 'it is not even reported as an expiry');
   assert.equal(res.payload.daysLeft, 0);
-  const writes = fsSets.filter((s) => s.data.trial_started_at);
-  assert.equal(writes.length, 0, 'an expired trial is never re-granted');
-});
-
-test('trial: day 29 still active with 1-2 days left', async () => {
-  fsDocs.users = { uid2: { trial_started_at: new Date(Date.now() - 29 * DAY - 1000).toISOString() } };
-  const res = makeRes();
-  await trialStatus(makeReq({}, { phone: '9999999999' }), res);
-  assert.equal(res.payload.active, true);
-  assert.ok(res.payload.daysLeft >= 1 && res.payload.daysLeft <= 2, `daysLeft=${res.payload.daysLeft}`);
+  assert.equal(
+    fsSets.filter((s) => s.path.startsWith('users/') && s.data.trial_started_at).length,
+    0,
+    'an old marker is never re-armed or rewritten'
+  );
 });
 
 // ── Delete -> re-register trial-abuse loop ───────────────────────────
@@ -258,25 +254,25 @@ test('trial: delete -> re-register gets NO fresh trial', async () => {
   assert.equal(freshGrants.length, 0, 'no fresh trial_started_at may ever be written');
 });
 
-test('trial: delete preserves the original trial — re-login resumes it, never extends', async () => {
+test('trial: delete remembers the old trial in the tombstone but it stays dead', async () => {
   const startedAt = new Date(Date.now() - 10 * DAY).toISOString();
   fsDocs.users = { uid2: { trial_started_at: startedAt } };
 
   const del = makeRes();
   await accountDelete(makeReq({ phone: '9999999999' }), del);
-  assert.equal(del.payload.trialPreserved, true, 'original trial start must be captured');
+  assert.equal(del.payload.trialPreserved, true, 'historical trial start is still captured');
   assert.equal(
     fsDocs.deletedAccounts['9999999999'].trial_started_at,
     startedAt,
-    'tombstone must carry the consumed trial'
+    'the tombstone still records it for historical bookkeeping'
   );
 
   const res = makeRes();
   await trialStatus(makeReq({}, { phone: '9999999999' }), res);
-  assert.equal(res.payload.active, true, 'the ORIGINAL trial continues (not a new one)');
-  assert.equal(res.payload.daysLeft, 20, '10 of the 30 days are already used');
+  assert.equal(res.payload.active, false, 'no tombstone can resurrect a removed trial');
+  assert.equal(res.payload.daysLeft, 0);
   const freshGrants = fsSets.filter((s) => s.path.startsWith('users/') && s.data.trial_started_at);
-  assert.equal(freshGrants.length, 0, 'the resumed trial must never be re-written');
+  assert.equal(freshGrants.length, 0, 'nothing is ever re-granted off the tombstone');
 });
 
 test('trial: tombstone lookup normalizes identifier case', async () => {
@@ -317,19 +313,12 @@ test('trial: unreadable tombstone store fails closed — no fresh grant', async 
   }
 });
 
-test('subscription/status: active trial reports subscribed with days left', async () => {
+test('subscription/status: a stale legacy trial_started_at is not subscribed', async () => {
   fsDocs.users = { uid2: { trial_started_at: new Date(Date.now() - 2 * DAY).toISOString() } };
   const res = makeRes();
   await subStatus(makeReq({}, { phone: '9999999999' }), res);
-  assert.equal(res.payload.subscribed, true);
-  assert.equal(res.payload.trial_days_left, 28);
-});
-
-test('subscription/status: expired trial is not subscribed', async () => {
-  fsDocs.users = { uid2: { trial_started_at: new Date(Date.now() - 40 * DAY).toISOString() } };
-  const res = makeRes();
-  await subStatus(makeReq({}, { phone: '9999999999' }), res);
-  assert.equal(res.payload.subscribed, false);
+  assert.equal(res.payload.subscribed, false, 'trials no longer count as Pro');
+  assert.equal(res.payload.trial_days_left, undefined, 'no trial countdown is ever reported');
 });
 
 test('chat: rejects an empty message', async () => {
@@ -340,21 +329,21 @@ test('chat: rejects an empty message', async () => {
 
 // ── Guru is a Pro feature ─────────────────────────────────────────────────
 // Every chat turn is billed through Gemini, so /chat must only answer for a
-// subscribed account. An unexpired trial counts as Pro, which is exactly what
-// a brand-new install has — so these tests run as a trial user.
+// subscribed account. Trials no longer exist, so these tests run as a PAID
+// user (subscribed: true, exactly what the Razorpay verify/webhook writes).
 function makeProUser(identifier = '9999999999') {
   const uid = uidMap[identifier];
   fsDocs.users = fsDocs.users || {};
   fsDocs.users[uid] = {
     ...(fsDocs.users[uid] || {}),
-    trial_started_at: new Date(Date.now() - 1 * DAY).toISOString(),
+    subscribed: true,
   };
   return identifier;
 }
 
-test('chat: a free user with no trial gets 403 pro_required', async () => {
-  // No trial, no subscription — the assistant must refuse BEFORE calling
-  // Gemini, so an unpaid account can never run up a bill.
+test('chat: a free user gets 403 pro_required', async () => {
+  // No subscription, no trial on record — the assistant must refuse BEFORE
+  // calling Gemini, so an unpaid account can never run up a bill.
   const res = makeRes();
   await callRoute('post', '/chat', makeReq({ message: 'how much protein in paneer?', phone: '9999999999' }), res);
 
@@ -363,7 +352,7 @@ test('chat: a free user with no trial gets 403 pro_required', async () => {
   assert.equal(gemini.bodies.length, 0, 'Gemini must never be called for a free user');
 });
 
-test('chat: an expired trial is no longer Pro -> 403 pro_required', async () => {
+test('chat: a stale legacy trial_started_at is ignored -> 403 pro_required', async () => {
   fsDocs.users = { uid2: { trial_started_at: new Date(Date.now() - 40 * DAY).toISOString() } };
   const res = makeRes();
   await callRoute('post', '/chat', makeReq({ message: 'what should I eat?', phone: '9999999999' }), res);
@@ -373,7 +362,7 @@ test('chat: an expired trial is no longer Pro -> 403 pro_required', async () => 
   assert.equal(gemini.bodies.length, 0);
 });
 
-test('chat: a trial (or paid) user CAN chat', async () => {
+test('chat: a paid user CAN chat', async () => {
   const pro = makeProUser();
   gemini.replies.push('Have some paneer.');
   const res = makeRes();
@@ -401,6 +390,18 @@ test('chat: a per-user rate limit caps how much one account can spend', async ()
   assert.equal(last.payload.error, 'rate_limited');
   assert.ok(last.headers['Retry-After'] !== undefined, 'Retry-After must be set');
   assert.equal(gemini.bodies.length, 30, 'exactly the capped number reached Gemini');
+});
+
+test('chat: fails closed when the shared rate-limit store is unavailable', async () => {
+  const pro = makeProUser();
+  failSharedTransactions = true;
+
+  const res = makeRes();
+  await callRoute('post', '/chat', makeReq({ message: 'protein in paneer?', phone: pro }), res);
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.payload.error, 'rate_limit_unavailable');
+  assert.equal(gemini.bodies.length, 0, 'Gemini must not be called without a shared counter');
 });
 
 test('chat: food-only system instruction + capped history + reply passthrough', async () => {

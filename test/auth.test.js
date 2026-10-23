@@ -52,8 +52,8 @@ const firestoreStub = {
         get: async () => ({ empty: true, docs: [] }),
       }),
     }),
-    // Single-doc transaction, matching how /analyze reserves a scan:
-    // read -> decide -> write, all against the same in-memory doc.
+    // Single-doc transaction, matching how /analyze and shared rate limits
+    // read -> decide -> write against the same in-memory doc.
     runTransaction: async (fn) => {
       const tx = {
         get: async (ref) => {
@@ -73,8 +73,9 @@ const firestoreStub = {
 };
 
 // Tokens the fake Admin SDK accepts. Anything else is invalid.
-// `email_verified: true` mirrors Google sign-in, which always arrives
-// verified — the admin Pro override requires it (see isAdminUser).
+// `email_verified: true` mirrors Google sign-in, which always arrives verified.
+// The admin Pro override does NOT look at the email at all — it requires the
+// `admin` custom claim, which only the Admin SDK can mint.
 const tokenClaims = {
   'token-a': { uid: 'uidA', email: 'a@example.com', email_verified: true },
   'token-b': { uid: 'uidB', email: 'b@example.com', email_verified: true },
@@ -225,7 +226,6 @@ const PROTECTED = [
   ['post', '/register'],
   ['get', '/user/profile'],
   ['post', '/referral/generate'],
-  ['get', '/referral/my-code/:phone'],
   ['get', '/me/referral-code'],
   ['post', '/referral/apply'],
   ['get', '/meals/:phone'],
@@ -246,6 +246,7 @@ const PROTECTED = [
 const REMOVED = [
   ['post', '/subscribe'], // any signed-in user could self-grant permanent Pro
   ['post', '/unsubscribe'],
+  ['get', '/referral/my-code/:phone'],
   ['get', '/meals/list/:phone'],
   ['post', '/meals/remove'],
   ['post', '/habits/sync'],
@@ -308,16 +309,19 @@ test('auth: the unprotected endpoints stay unprotected', () => {
 
 // ── Client-supplied identity is ignored ─────────────────────────────────
 test('auth: a client-sent phone/email can never act as another account', async () => {
+  // The trial grant this test used to ride on is gone (trials are removed);
+  // the same guarantee now lives in every state-writing route. /me/referral-code
+  // mints a code for the TOKEN's user (uidB) and writes it to THEIR doc — a
+  // claimed identity in the query must never redirect that write to uidA.
   const res = makeRes();
   await callRoute(
     'get',
-    '/trial/status',
+    '/me/referral-code',
     makeReq({ query: { phone: 'a@example.com', email: 'a@example.com' } }, 'token-b'),
     res
   );
 
   assert.equal(res.statusCode, 200);
-  // The trial was granted to the TOKEN's user (uidB), not to the claimed one.
   assert.ok(fsSets.some((s) => s.path === 'users/uidB'), 'must write the token owner');
   assert.ok(!fsSets.some((s) => s.path === 'users/uidA'), 'must not touch the claimed account');
 });
@@ -326,8 +330,8 @@ test('auth: /me/referral-code ignores any identifier in the URL', async () => {
   const res = makeRes();
   await callRoute(
     'get',
-    '/referral/my-code/:phone',
-    makeReq({ params: { phone: 'a@example.com' } }, 'token-b'),
+    '/me/referral-code',
+    makeReq({}, 'token-b'),
     res
   );
   assert.equal(res.statusCode, 200);
@@ -377,6 +381,70 @@ test('analyze: 3 free scans per day, then 403 scan_limit_reached', async () => {
   assert.equal(fourth.body.scans_remaining, 0);
 });
 
+test('analyze: the AI total weight becomes the starting serving', async () => {
+  geminiSays({
+    description: 'two boiled eggs',
+    confidence: 0.94,
+    total_grams: 95,
+    dishes: [{
+      name: 'Chicken egg',
+      calories_per_100g: 143,
+      protein_g_per_100g: 12.6,
+      carbs_g_per_100g: 0.6,
+      fats_g_per_100g: 9.6,
+    }],
+  });
+  try {
+    const res = makeRes();
+    await callRoute('post', '/analyze', makeReq({}, 'token-a'), res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.grams, 95, 'the portion estimate must ride along');
+  } finally {
+    global.fetch = confidentGeminiFetch;
+  }
+});
+
+test('analyze: a wild or missing total_grams is clamped, never trusted blindly', async () => {
+  geminiSays({
+    description: 'comically large plate',
+    confidence: 0.9,
+    total_grams: 99999,
+    dishes: [{
+      name: 'Rice',
+      calories_per_100g: 130,
+      protein_g_per_100g: 2.7,
+      carbs_g_per_100g: 28,
+      fats_g_per_100g: 0.3,
+    }],
+  });
+  try {
+    const huge = makeRes();
+    await callRoute('post', '/analyze', makeReq({}, 'token-a'), huge);
+    assert.equal(huge.body.grams, 3000, 'clamped to the 3 kg ceiling');
+  } finally {
+    global.fetch = confidentGeminiFetch;
+  }
+
+  geminiSays({
+    description: 'no weight supplied',
+    confidence: 0.9,
+    dishes: [{
+      name: 'Rice',
+      calories_per_100g: 130,
+      protein_g_per_100g: 2.7,
+      carbs_g_per_100g: 28,
+      fats_g_per_100g: 0.3,
+    }],
+  });
+  try {
+    const missing = makeRes();
+    await callRoute('post', '/analyze', makeReq({}, 'token-a'), missing);
+    assert.equal(missing.body.grams, 100, 'no weight → the old 100 g default');
+  } finally {
+    global.fetch = confidentGeminiFetch;
+  }
+});
+
 test('analyze: a stale count from yesterday (IST) never blocks today', async () => {
   fsDocs.users = { uidA: { scanCount: 3, scanDay: '2020-01-01' } };
   const res = makeRes();
@@ -402,8 +470,9 @@ test('analyze: a Pro user is never blocked and reports no limit', async () => {
 test('analyze: the owner/admin account is exempt from the limit', async () => {
   const adminToken = {
     uid: 'uidAdmin',
-    email: 'prabhasaaho213@gmail.com',
+    email: 'owner@example.com',
     email_verified: true,
+    admin: true, // custom claim, set with the Admin SDK
   };
   tokenClaims['token-admin'] = adminToken;
   try {
@@ -417,20 +486,20 @@ test('analyze: the owner/admin account is exempt from the limit', async () => {
   }
 });
 
-// An email/password account can hold an address it never proved it owns.
-// Without the verified-email gate, anyone able to register with the owner's
-// address would inherit free Pro — so an UNVERIFIED admin email must not.
-test('analyze: an UNVERIFIED admin email gets no Pro override', async () => {
+// An email address is not a credential. Even a VERIFIED address must grant
+// nothing: the old email match meant anyone who registered the owner's address
+// inherited free Pro.
+test('analyze: a verified admin email without the claim gets no Pro override', async () => {
   tokenClaims['token-fake-admin'] = {
     uid: 'uidFakeAdmin',
-    email: 'prabhasaaho213@gmail.com',
-    email_verified: false,
+    email: 'owner@example.com',
+    email_verified: true,
   };
   try {
     const res = makeRes();
     await callRoute('post', '/analyze', makeReq({}, 'token-fake-admin'), res);
     assert.equal(res.statusCode, 200);
-    assert.equal(res.body.subscribed, false, 'unverified email must not claim the owner\'s Pro');
+    assert.equal(res.body.subscribed, false, 'no claim means no Pro, whatever the email');
     assert.equal(res.body.scans_limit, 3, 'a free user still has the normal limit');
   } finally {
     delete tokenClaims['token-fake-admin'];
@@ -543,6 +612,10 @@ test('referral/apply: grants ~30 days of Pro and never writes a permanent flag',
     'a referral must not grant permanent Pro');
   assert.equal(fsDocs.users.uidA.referredBy, 'ABCD');
   assert.ok(fsDocs.users.uidB.pro_until, 'the referrer earns the window too');
+  assert.ok(fsDocs.users.uidA.pro_until_at instanceof Date,
+    'Firestore rules need a timestamp for the invitee entitlement');
+  assert.ok(fsDocs.users.uidB.pro_until_at instanceof Date,
+    'Firestore rules need a timestamp for the referrer entitlement');
   assert.notEqual(fsDocs.users.uidB.subscribed, true,
     'the referrer is capped too — one code must not buy forever Pro');
 });
@@ -581,6 +654,8 @@ test('subscription/status: a live referral window is Pro, an expired one is not'
   const live = makeRes();
   await callRoute('get', '/subscription/status', makeReq({}, 'token-a'), live);
   assert.equal(live.body.subscribed, true, 'a live window must unlock Pro');
+  assert.ok(fsDocs.users.uidA.pro_until_at instanceof Date,
+    'existing referral windows must be backfilled for Firestore rules');
 
   fsDocs.users = { uidA: { pro_until: new Date(Date.now() - DAY_MS).toISOString() } };
   const expired = makeRes();

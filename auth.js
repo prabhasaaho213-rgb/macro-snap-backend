@@ -55,13 +55,17 @@ async function requireAuth(req, res, next) {
 // by (the app has always used the email or phone number as its account id);
 // `uid` is the Firebase UID that Firestore documents are keyed by.
 //
-// `emailVerified` carries the token's `email_verified` claim. It matters for
-// TRUST DECISIONS: Google sign-in always arrives verified, but an
-// email/password account can hold an address it never proved it owns. So
-// anything that grants privilege on the address (the admin Pro override) must
-// check this flag. It does NOT gate `identifier`/`email` themselves — data is
-// keyed by that address either way, and dropping it would lock a legitimate
-// unverified user out of their own history.
+// `emailVerified` carries the token's `email_verified` claim. Google sign-in
+// always arrives verified, but an email/password account can hold an address it
+// never proved it owns, so anything that keys TRUST on the address must check
+// it. It does NOT gate `identifier`/`email` themselves — data is keyed by that
+// address either way, and dropping it would lock a legitimate unverified user
+// out of their own history.
+//
+// `isAdmin` is the `admin` CUSTOM CLAIM. Privilege (free Pro, the scan-limit
+// exemption, "this account cannot be deleted") hangs off this claim and nothing
+// else: it is set only by the Admin SDK (see ensureAdminClaim in server.js) and
+// can never be produced by a client. An email address is not a credential.
 function identityOf(req) {
   const user = (req && req.user) || {};
   const email =
@@ -75,7 +79,15 @@ function identityOf(req) {
   const uid = typeof user.uid === 'string' && user.uid ? user.uid : null;
   // Only a POSITIVE claim counts: missing/undefined is treated as unverified.
   const emailVerified = user.email_verified === true;
-  return { uid, email, phone, emailVerified, identifier: email || phone || uid || null };
+  const isAdmin = user.admin === true;
+  return {
+    uid,
+    email,
+    phone,
+    emailVerified,
+    isAdmin,
+    identifier: email || phone || uid || null,
+  };
 }
 
 module.exports = { requireAuth, verifyIdToken, bearerToken, identityOf };

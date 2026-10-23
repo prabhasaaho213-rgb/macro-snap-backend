@@ -24,9 +24,44 @@ const upload = multer({
 // Capture the raw request body for every request so the Razorpay payment
 // webhook can verify its HMAC signature against the exact bytes sent
 // (express.json alone would only give us the parsed object).
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+// A 100 KB (Express's default) body cap is too small for /meals/sync, which
+// posts the user's whole history on a first login: ~200 bytes per meal means a
+// few hundred meals is already past it, and the client would get a 413 that
+// looks like a server fault. 1 MB is far above any legitimate batch and still
+// bounds the parse. (Images never come through here — they are multipart.)
+app.use(
+  express.json({
+    limit: '1mb',
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+
+// ─── CORS: allowlist, not `*` ──────────────────────────────────────────
+// The Flutter app is not a browser and sends no Origin header, so it needs no
+// CORS at all. Only the web build (and the marketing/docs pages) do, and
+// `Access-Control-Allow-Origin: *` on an API that authenticates with a Bearer
+// token lets ANY site a user visits call it with that user's token.
+//
+// CORS_ORIGINS is a comma-separated allowlist. When it is unset nothing is
+// echoed, which is correct for the app and fails closed for the web.
+const CORS_ORIGINS = String(process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim().replace(/\/$/, ''))
+  .filter(Boolean);
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (origin && CORS_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    // Any response can differ per Origin, so caches must key on it.
+    res.header('Vary', 'Origin');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+    res.header('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
@@ -35,8 +70,20 @@ app.use((req, res, next) => {
 // gracefully through the safe dbq() helper below and scan limits /
 // subscription state are read from Firestore instead.
 const dbAvailable = !!process.env.DATABASE_URL;
+// TLS to Postgres is VERIFIED by default. `rejectUnauthorized: false` accepted
+// any certificate, so anyone able to answer on the database host could present
+// their own and read every query (IDs, payment rows, subscription state) in
+// clear. Managed providers ship a trusted CA, so verification normally just
+// works; PG_SSL_NO_VERIFY=1 is the escape hatch for a provider with a private
+// CA (mount its CA and pass it in PGSSLROOTCERT instead when possible).
+const pgSsl = process.env.DATABASE_SSL === 'disable'
+  ? false
+  : {
+      rejectUnauthorized: process.env.PG_SSL_NO_VERIFY !== '1',
+      ca: process.env.PGSSLROOTCERT || undefined,
+    };
 const pool = dbAvailable
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: pgSsl })
   : null;
 firestore.init();
 
@@ -77,6 +124,13 @@ const GEMINI_API_VERSION = process.env.GEMINI_API_VERSION || 'v1';
 // ?key= query string leaks into request logs, proxies, and any error message
 // that echoes the URL. (Authorization: Bearer is for OAuth access tokens, not
 // for API keys, so it is deliberately not used here.)
+// Every Gemini call is bounded. Without a timeout a hung upstream connection
+// held the request open until the platform killed the function — and on a
+// serverless host that kill also took the scan refund with it, so the user
+// paid an allowance for a photo that was never analysed. 25 s leaves room for
+// a large image plus the model's thinking, and short of Vercel's 60 s cap.
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 25000;
+
 async function geminiGenerate(body) {
   return fetch(
     `https://generativelanguage.googleapis.com/${GEMINI_API_VERSION}/models/${GEMINI_MODEL}:generateContent`,
@@ -89,19 +143,16 @@ async function geminiGenerate(body) {
       // Accepts a pre-stringified body or a plain object, whichever the
       // caller already has (the /analyze prompt is built as a string).
       body: typeof body === 'string' ? body : JSON.stringify(body),
+      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
     }
   );
 }
 
-// ─── Per-user rate limiting ──────────────────────────────────────────────
-// Every route below calls Gemini on our API key, so an unthrottled endpoint
-// is an open-ended bill. This is a simple fixed-window counter per user per
-// route — no dependency, and no state to lose on serverless cold starts
-// (worst case a burst gets one extra window, which is still bounded).
-//
-// Keyed on the VERIFIED uid, never on a client-supplied field, so one user
-// cannot evade the cap by rotating a header. Guests (no uid) are keyed by
-// remote address, which is the only identity we have for them.
+// ─── Shared per-user rate limiting ───────────────────────────────────────
+// Gemini spending must be capped across serverless instances, so counters
+// live in Firestore and are incremented atomically. If the shared store is
+// unavailable, these expensive routes fail closed instead of falling back to
+// per-instance limits that can be bypassed by instance fan-out.
 const RATE_WINDOWS = {
   // route            per-minute cap
   '/chat': 30,
@@ -109,33 +160,68 @@ const RATE_WINDOWS = {
   '/generate-diet-plan': 6,
 };
 const RATE_WINDOW_MS = 60 * 1000;
-const rateBuckets = new Map(); // key -> { windowStart, count }
+const RATE_LIMIT_COLLECTION = 'rateLimits';
 
-// Test seam: lets a test reset the counters without reaching into the Map.
-function resetRateLimits() {
-  rateBuckets.clear();
-}
-
-// Returns null when the caller may proceed, or the number of ms until the
-// next window when they have exceeded the cap.
-function rateLimitFor(bucketKey, limit) {
-  const now = Date.now();
-  let b = rateBuckets.get(bucketKey);
-  if (!b || now - b.windowStart >= RATE_WINDOW_MS) {
-    b = { windowStart: now, count: 0 };
-    rateBuckets.set(bucketKey, b);
+// Returns null when allowed, or milliseconds until the window resets.
+async function sharedRateLimitFor(bucketKey, limit) {
+  if (!firestore.isEnabled()) throw new Error('Firestore rate-limit store is disabled');
+  const db = firestore.getDb();
+  if (!db || typeof db.runTransaction !== 'function') {
+    throw new Error('Firestore transactions are unavailable');
   }
-  b.count += 1;
-  return b.count > limit ? b.windowStart + RATE_WINDOW_MS - now : null;
+
+  const docId = crypto.createHash('sha256').update(bucketKey).digest('hex');
+  const ref = db.collection(RATE_LIMIT_COLLECTION).doc(docId);
+  let retryAfterMs = null;
+
+  await db.runTransaction(async (tx) => {
+    const now = Date.now();
+    const snapshot = await tx.get(ref);
+    const data = snapshot.exists ? snapshot.data() || {} : {};
+    const windowStartMs = Number(data.windowStartMs);
+    const count = Number(data.count) || 0;
+
+    if (!Number.isFinite(windowStartMs) || now < windowStartMs || now - windowStartMs >= RATE_WINDOW_MS) {
+      tx.set(ref, {
+        windowStartMs: now,
+        count: 1,
+        expiresAt: new Date(now + RATE_WINDOW_MS * 2),
+      });
+      retryAfterMs = null;
+      return;
+    }
+
+    if (count >= limit) {
+      retryAfterMs = windowStartMs + RATE_WINDOW_MS - now;
+      return;
+    }
+
+    tx.set(ref, {
+      count: count + 1,
+      expiresAt: new Date(windowStartMs + RATE_WINDOW_MS * 2),
+    }, { merge: true });
+    retryAfterMs = null;
+  });
+
+  return retryAfterMs;
 }
 
 // Express guard for one of the RATE_WINDOWS routes. 429 with Retry-After.
 function rateLimit(route) {
   const limit = RATE_WINDOWS[route];
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const uid = (req.user && req.user.uid) || null;
     const key = uid || (req.ip || 'anon') + ':' + route;
-    const retryAfterMs = rateLimitFor(key + ':' + route, limit);
+    let retryAfterMs;
+    try {
+      retryAfterMs = await sharedRateLimitFor(key + ':' + route, limit);
+    } catch (e) {
+      console.error('Shared rate-limit check failed:', e.message);
+      return res.status(503).json({
+        error: 'rate_limit_unavailable',
+        message: 'This service is temporarily unavailable. Please try again shortly.',
+      });
+    }
     if (retryAfterMs == null) return next();
     res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
     return res.status(429).json({
@@ -191,7 +277,7 @@ async function getPlanId() {
     const match = (plans.items || []).find(
       (p) =>
         p.item &&
-        p.item.amount === 2900 &&
+        p.item.amount === 4900 &&
         p.item.name === 'MacroSnap Pro' &&
         p.period === 'monthly' &&
         p.interval === 1
@@ -206,7 +292,7 @@ async function getPlanId() {
     interval: 1,
     item: {
       name: 'MacroSnap Pro',
-      amount: 2900, // ₹29 in paise
+      amount: 4900, // ₹49 in paise
       currency: 'INR',
       description: 'MacroSnap Pro monthly subscription',
     },
@@ -305,15 +391,16 @@ async function initDB(retries = 5) {
             id SERIAL PRIMARY KEY,
             phone TEXT NOT NULL,
             transaction_ref TEXT NOT NULL,
-            amount INTEGER DEFAULT 29,
+            amount INTEGER DEFAULT 49,
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW()
           );
         `);
-        // Deletion tombstone: remembers an account's identifier (phone/email)
-        // and its ORIGINAL trial start AFTER the account is deleted. This is
-        // what stops a delete -> re-login -> fresh free-trial loop — see
-        // getDeletionTombstone()/getOrGrantTrial(). Never wiped.
+        // Deleted-account tombstone: remembers an account's identifier
+        // (phone/email) and its PRE-REMOVAL trial metadata AFTER the account
+        // is deleted. The free trial no longer exists, so the tombstone is
+        // passive now — it is still written so a future pricing experiment
+        // can never be farmed by delete -> re-register loops. Never wiped.
         await client.query(`
           CREATE TABLE IF NOT EXISTS deleted_accounts (
             identifier TEXT PRIMARY KEY,
@@ -364,31 +451,80 @@ function istDayEndsAt(now = Date.now()) {
 }
 
 // The owner/admin account is always Pro — exempt from the free scan limit.
-// Mirrors SubscriptionService.adminEmail in the Flutter app. After Google
-// sign-in the app sends the user's email as the `phone` field, so a simple
-// case-insensitive match identifies the admin here.
 //
-// REQUIRES A VERIFIED EMAIL. `email_verified` is true for Google sign-in but
-// false for a brand-new email/password account — so without this check anyone
-// who enables that sign-in method and registers with the admin's address gets
-// free Pro. An unverified address must never claim the owner's privileges.
-const ADMIN_EMAIL = 'prabhasaaho213@gmail.com';
-
-function isAdminUser(identifier, emailVerified) {
-  if (emailVerified !== true) return false;
-  return typeof identifier === 'string' &&
-    identifier.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase();
+// The privilege is a Firebase CUSTOM CLAIM (`admin: true`), minted with the
+// Admin SDK right here by ensureAdminClaim() and mirrored by `hasPro()` in
+// firestore.rules. It used to be an email string compared against the token:
+// the address sat in the source of both the server and the app, and anyone who
+// could register that address held the same "proof". A custom claim is signed
+// by Google into the ID token, so a client cannot mint it.
+function isAdminUser(identity) {
+  return !!identity && identity.isAdmin === true;
 }
 
-// ── 30-day free trial ────────────────────────────────────────────────────
-// Every user — new signups and existing users after they update + log in —
-// gets ONE 30-day free Pro plan. The grant is one-time: trial_started_at is
-// written only when absent and is never reset, so the trial can only ever be
-// claimed once per account. Firestore users/{uid}.trial_started_at is the
-// source of truth; Postgres is a best-effort fallback for legacy
-// deployments (the column may not exist there, which we swallow).
-const TRIAL_DAYS = 30;
-const DAY_MS = 24 * 60 * 60 * 1000;
+// Grants the `admin` claim to the owner account(s) at boot.
+//
+// Set ADMIN_EMAIL (comma-separated) in the environment — this is the ONE place
+// the owner's address lives, it never ships in the app, and removing it from
+// the env revokes nothing by itself: run `ensureAdminClaim` with the claim set
+// to false, or clear custom claims, to revoke. No-op when Firebase Admin is not
+// configured (local/dev without a service account).
+async function ensureAdminClaim() {
+  const emails = String(process.env.ADMIN_EMAIL || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!emails.length) return;
+  const admin = firestore.getAdmin ? firestore.getAdmin() : null;
+  if (!admin) {
+    console.warn('ADMIN_EMAIL is set but Firebase Admin is unavailable — admin claim not applied');
+    return;
+  }
+  for (const email of emails) {
+    try {
+      const user = await admin.auth().getUserByEmail(email);
+      const claims = user.customClaims || {};
+      if (claims.admin !== true) {
+        await admin.auth().setCustomUserClaims(user.uid, { ...claims, admin: true });
+        console.log(`admin claim granted to ${email}`);
+      }
+    } catch (e) {
+      console.warn(`admin claim for ${email} failed: ${e.message}`);
+    }
+  }
+}
+
+// ── Run the admin-claim sync on the FIRST REQUEST ────────────────────────
+// ensureAdminClaim() used to run only inside `if (require.main === module)`,
+// which is the `node server.js` path (local / Railway). Vercel IMPORTS this
+// module as its handler and never executes that block, so on Vercel the
+// owner's `admin` claim was never minted: no free Pro, no scan-limit
+// exemption, and firestore.rules denied the owner's admin writes. Running it
+// once, lazily, on the first request works on every host.
+//
+// It needs ADMIN_EMAIL in the environment to do anything; without it the call
+// returns immediately (and this is a no-op).
+let adminClaimStarted = false;
+function startAdminClaimOnce() {
+  if (adminClaimStarted) return;
+  adminClaimStarted = true;
+  ensureAdminClaim().catch((e) =>
+    console.warn(`ensureAdminClaim failed: ${e.message}`)
+  );
+}
+app.use((req, res, next) => {
+  startAdminClaimOnce();
+  next();
+});
+
+// ── Pricing: first month free ──────────────────────────────────────────
+// The old 30-day free trial is GONE — for new and existing users alike (the
+// owner/admin account keeps its permanent claim-based Pro). Pro now starts
+// with a Razorpay subscription whose FIRST MONTH IS ₹0: at checkout the
+// customer approves the ₹49/month autopay mandate, and the first ₹49 charge
+// only happens after day 30. The approval — not a price break — is what
+// both user and Razorpay see up front.
+const FIRST_MONTH_FREE_DAYS = 30;
 
 // A referral grants a 30-DAY Pro WINDOW (`pro_until`), not a permanent
 // `subscribed` flag — an expired referral therefore drops the user back to
@@ -397,127 +533,6 @@ function proUntilActive(iso) {
   if (!iso) return false;
   const t = Date.parse(typeof iso === 'string' ? iso : String(iso));
   return Number.isFinite(t) && t > Date.now();
-}
-
-function trialState(startedAt, now = Date.now()) {
-  if (!startedAt) return { active: false, expired: false, daysLeft: 0 };
-  const started = new Date(startedAt).getTime();
-  if (Number.isNaN(started)) return { active: false, expired: false, daysLeft: 0 };
-  const ends = started + TRIAL_DAYS * DAY_MS;
-  const endsAt = new Date(ends).toISOString();
-  if (now >= ends) return { active: false, expired: true, daysLeft: 0, endsAt };
-  return {
-    active: true,
-    expired: false,
-    daysLeft: Math.max(1, Math.ceil((ends - now) / DAY_MS)),
-    endsAt,
-  };
-}
-
-// Reads the deletion tombstone for an identifier (Postgres + Firestore).
-// Returns { found, trialStartedAt, errored }:
-//   found   = this account was deleted; trialStartedAt is the trial it had
-//             already consumed (null if it never claimed one).
-//   errored = a configured tombstone store could NOT be read, so "no
-//             tombstone" cannot be proven — getOrGrantTrial then fails
-//             closed and mints no fresh trial.
-// getOrGrantTrial uses this to never re-grant a fresh trial to a
-// deleted-and-re-registered account.
-async function getDeletionTombstone(identifier) {
-  const out = { found: false, trialStartedAt: null, errored: false };
-  // Firestore tombstone (deletedAccounts/{identifier}) — survives on the
-  // DB-less deployment and is keyed (lowercased) by identifier so it holds
-  // even after the Firebase Auth user (and its uid-keyed docs) are gone.
-  if (firestore.isEnabled()) {
-    try {
-      const idKey = String(identifier).toLowerCase();
-      const snap = await firestore.getDb().collection('deletedAccounts').doc(idKey).get();
-      if (snap.exists) {
-        const d = snap.data() || {};
-        return { found: true, trialStartedAt: d.trial_started_at || null, errored: false };
-      }
-    } catch (_) {
-      out.errored = true; // store unreachable — absence is unproven
-    }
-  }
-  // Postgres tombstone. Matched CASE-INSENSITIVELY: the same mail can
-  // arrive as 'User@x.com' at deletion time and 'user@x.com' at re-login,
-  // and an exact match would miss the tombstone and re-open the trial loop.
-  if (dbAvailable) {
-    const r = await dbq(
-      'SELECT trial_started_at FROM deleted_accounts WHERE LOWER(identifier) = LOWER($1) OR LOWER(phone) = LOWER($1) OR LOWER(email) = LOWER($1) LIMIT 1',
-      [identifier]
-    );
-    if (r._failed) out.errored = true;
-    else if (r.rows && r.rows.length > 0) {
-      return { found: true, trialStartedAt: r.rows[0].trial_started_at || null, errored: false };
-    }
-  }
-  return out;
-}
-
-// Reads the trial start for an identifier, granting the one-time trial when
-// no record exists yet. Returns the ISO start or null when nothing can be
-// stored (no Firestore doc and no DB) — the caller then reports no trial.
-async function getOrGrantTrial(identifier) {
-  // A deleted account can NEVER claim a fresh free trial. The tombstone
-  // preserves the ORIGINAL trial start (or null), so re-login after deletion
-  // reports the already-consumed trial (usually expired) instead of a new
-  // 30 days — this closes the delete -> re-register trial-abuse loop.
-  const tomb = await getDeletionTombstone(identifier);
-  if (tomb.found) return tomb.trialStartedAt;
-  // Fail closed: when the tombstone store could not be READ we cannot prove
-  // this identity never deleted its account — never mint a fresh trial.
-  // (Existing trials are still returned below, so a transient error never
-  // strips a legit countdown.)
-  const refuseFreshGrant = tomb.errored;
-  const fUid = await firestore.resolveUid(identifier);
-  if (fUid && firestore.isEnabled()) {
-    try {
-      const ref = firestore.getDb().collection('users').doc(fUid);
-      const doc = await ref.get();
-      const existing = doc.exists ? doc.data().trial_started_at : null;
-      if (existing) return existing;
-      if (refuseFreshGrant) return null;
-      const nowIso = new Date().toISOString();
-      await firestore.set('users/' + fUid, { trial_started_at: nowIso }, { merge: true });
-      return nowIso;
-    } catch (_) {}
-  }
-  try {
-    const r = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
-    const existing = r.rows[0] && r.rows[0].trial_started_at;
-    if (existing) return existing;
-    if (refuseFreshGrant) return null;
-    const nowIso = new Date().toISOString();
-    // Persist the grant so it stays ONE-TIME. The old bare UPDATE matched
-    // no row for a brand-new identity, so every check silently re-issued a
-    // fresh 30-day window. Write only while absent, create the row when the
-    // identity has none, then report what actually got stored (null if
-    // nothing did — an unpersisted start would roll forever).
-    await dbq(
-      'UPDATE users SET trial_started_at = $2 WHERE (phone = $1 OR email = $1) AND trial_started_at IS NULL',
-      [identifier, nowIso]
-    );
-    await dbq(
-      'INSERT INTO users (phone, trial_started_at) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM users WHERE phone = $1 OR email = $1)',
-      [identifier, nowIso]
-    );
-    const back = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
-    return (back.rows[0] && back.rows[0].trial_started_at) || null;
-  } catch (_) {
-    return null; // DB-less legacy deployment without Firestore — no trial.
-  }
-}
-
-// Postgres-only trial lookup (never grants). Swallows a missing column.
-async function pgTrial(identifier) {
-  try {
-    const r = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
-    return trialState(r.rows[0] && r.rows[0].trial_started_at);
-  } catch (_) {
-    return { active: false, expired: false, daysLeft: 0 };
-  }
 }
 
 // ─── Free-scan entitlements — the SERVER is the authority ─────────────────
@@ -529,12 +544,14 @@ async function pgTrial(identifier) {
 //
 // The counter resets at IST midnight: a value stored for a previous IST day
 // is stale and reads as zero, so a user gets a fresh 3 every Indian morning.
-async function entitlementsFor({ uid, identifier, emailVerified }) {
+async function entitlementsFor({ uid, identifier, emailVerified, isAdmin }) {
   const day = istDayKey();
   const resetAt = istDayEndsAt();
   // The owner/admin account is always Pro — exempt from the free limit.
-  let subscribed = !!identifier && isAdminUser(identifier, emailVerified);
-  let trialEndsAt = null;
+  // The paid flag comes from the Razorpay webhook/verify (subscribed:true).
+  // The old 30-day trial no longer applies to anyone: trial_started_at may
+  // still exist on old docs and is ignored everywhere now.
+  let subscribed = isAdminUser({ isAdmin });
   let storedDay = null;
   let count = 0;
 
@@ -546,11 +563,6 @@ async function entitlementsFor({ uid, identifier, emailVerified }) {
       if (d.subscribed === true) subscribed = true;
       // A referral's 30-day window counts as Pro until it passes.
       if (!subscribed && proUntilActive(d.pro_until)) subscribed = true;
-      const ts = trialState(d.trial_started_at);
-      if (ts.active) {
-        subscribed = true;
-        trialEndsAt = ts.endsAt;
-      }
       storedDay = d.scanDay || null;
       count = Number(d.scanCount) || 0;
     } catch (_) {}
@@ -566,11 +578,6 @@ async function entitlementsFor({ uid, identifier, emailVerified }) {
       const row = u.rows[0];
       if (row && row.subscribed) subscribed = true;
       if (!subscribed && proUntilActive(row && row.pro_until)) subscribed = true;
-      const ts = trialState(row && row.trial_started_at);
-      if (ts.active) {
-        subscribed = true;
-        trialEndsAt = ts.endsAt;
-      }
     }
     if (storedDay === null) {
       const r = await dbq('SELECT scan_count, scan_day FROM users WHERE phone = $1 LIMIT 1', [identifier]);
@@ -589,7 +596,6 @@ async function entitlementsFor({ uid, identifier, emailVerified }) {
     scans_remaining: subscribed ? null : Math.max(0, SCAN_LIMIT_FREE - used),
     scan_day: day,
     reset_at: resetAt,
-    trial_ends_at: trialEndsAt,
   };
 }
 
@@ -681,7 +687,142 @@ async function releaseScan({ uid, identifier, day }) {
   }
 }
 
-app.post('/analyze', requireAuth, upload.single('image'), rateLimit('/analyze'), async (req, res) => {
+// ─── Unidentified-scan refund budget ──────────────────────────────────
+// A low-confidence or "Unknown" scan is refunded below, which is right for the
+// user and free for them — and that is the problem. A stream of photos that
+// are not food keeps being refunded, so ONE account can drive unlimited Gemini
+// spend at our cost, bounded only by 20 requests a minute. Each account gets
+// REFUND_CAP_PER_DAY refunds a day; past that an unidentified photo simply
+// counts as a scan, so the worst case is REFUND_CAP + SCAN_LIMIT_FREE model
+// calls per account per day.
+const REFUND_CAP_PER_DAY = 15;
+
+// Claims one refund from today's budget. Returns true when the refund may be
+// given. Never throws: when the counter store cannot be read or written it
+// returns true, because a wrongly withheld refund is a user-visible bug while
+// an extra Gemini call is only money.
+async function takeRefundBudget({ uid, day }) {
+  if (!uid || !firestore.isEnabled()) return true;
+  const db = firestore.getDb();
+  const ref = db.collection('users').doc(uid);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      const d = (doc.exists ? doc.data() : {}) || {};
+      const count = d.refundDay === day ? (Number(d.refundCount) || 0) : 0;
+      if (count >= REFUND_CAP_PER_DAY) return false;
+      tx.set(ref, { refundCount: count + 1, refundDay: day }, { merge: true });
+      return true;
+    });
+  } catch (e) {
+    console.error('Refund budget check failed (allowing the refund):', e.message);
+    return true;
+  }
+}
+
+// Meal weight in grams, or 0 when the AI did not send a usable number.
+// Clamped to the same 5–5000 g range the card can render.
+function clampGrams(value) {
+  // numOr, not Number: the model writes "150 g" as often as 150, and Number
+  // turned every one of those into 0 — which silently fell back to the whole
+  // dish's weight for that component.
+  const n = numOr(value, 0);
+  if (n <= 0) return 0;
+  return Math.min(5000, Math.round(n));
+}
+
+// ─── AI output is untrusted input ──────────────────────────────────────
+// The model is asked for numbers, and it usually sends numbers — but it also
+// sends "250 kcal", "~12", null, or an object, depending on the day. The app
+// casts these with `as num`, so ONE bad value used to throw a TypeError while
+// building the result card, stranding the user on a blank screen after a scan
+// they had already paid for. Everything below coerces and clamps so the shape
+// is guaranteed, whatever the model produced.
+const MAX_DISHES = 12;
+const MAX_NAME_LEN = 60;
+
+// A number, or [fallback]. Accepts a numeric string ("250") and a string that
+// merely starts with one ("250 kcal"), which is the common model slip.
+function numOr(value, fallback = 0) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
+  const parsed = parseFloat(String(value == null ? '' : value));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function clampRange(value, min, max, fallback = 0) {
+  const n = numOr(value, fallback);
+  return Math.min(max, Math.max(min, n));
+}
+
+// A trimmed, bounded string. Non-strings (objects, arrays, numbers) collapse to
+// [fallback] rather than reaching the app as the wrong JSON type.
+function cleanText(value, fallback = '', maxLen = MAX_NAME_LEN) {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLen) : fallback;
+}
+
+// A dish's weight, with a fallback the prompt cannot always guarantee: when
+
+// the model sent no usable dish weight but DID name component weights (which
+// it must, per the prompt, sum to the dish), their sum is the dish weight.
+function dishGramsFrom(d, ingredients) {
+  const direct = clampGrams(d.grams);
+  if (direct > 0) return direct;
+  const sum = ingredients.reduce((s, i) => s + i.grams, 0);
+  return sum > 0 ? Math.min(5000, Math.round(sum)) : 0;
+}
+
+// Total edible weight of EVERYTHING visible — the app opens its serving here.
+// Trust the model's total when it sent one; otherwise the sum of the per-dish
+// weights (already clamped). 0 means "unknown": the caller keeps the
+// historical 100 g baseline so old prompts behave exactly as before.
+function totalGramsFrom(json, normalizedDishes) {
+  const raw = numOr(json.total_grams, 0);
+  if (raw > 0) {
+    return Math.min(3000, Math.max(5, Math.round(raw)));
+  }
+  const sum = normalizedDishes.reduce((s, d) => s + Math.max(0, d.grams || 0), 0);
+  return sum > 0 ? Math.min(3000, Math.max(5, Math.round(sum))) : 0;
+}
+
+const SUITABLE_FOR = new Set(['bulk', 'diet', 'both']);
+function cleanSuitableFor(value) {
+  const v = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return SUITABLE_FOR.has(v) ? v : 'both';
+}
+
+// Per-100 g nutrition, clamped to what is physically possible: no food is
+// above 900 kcal/100 g (pure fat) and no macronutrient is above 100 g/100 g.
+function macrosFrom(d) {
+  return {
+    calories_per_100g: Math.round(clampRange(d.calories_per_100g ?? d.calories, 0, 900)),
+    protein_g_per_100g: clampRange(d.protein_g_per_100g ?? d.protein_g, 0, 100),
+    carbs_g_per_100g: clampRange(d.carbs_g_per_100g ?? d.carbs_g, 0, 100),
+    fats_g_per_100g: clampRange(d.fats_g_per_100g ?? d.fats_g, 0, 100),
+    fiber_g_per_100g: clampRange(d.fiber_g_per_100g ?? d.fiber_g, 0, 100),
+    sugar_g_per_100g: clampRange(d.sugar_g_per_100g ?? d.sugar_g, 0, 100),
+  };
+}
+
+// The visible components of one dish. Optional and defensive: the model is
+// asked for them, but a photo of a smoothie genuinely has none, and a bad
+// shape from the model must never turn into a 500 or a card full of zeros.
+function normalizeIngredients(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((i) => i && typeof i === 'object' && cleanText(i.name, ''))
+    .slice(0, 12)
+    .map((i) => ({
+      name: cleanText(i.name, ''),
+      grams: clampGrams(i.grams),
+      health_score: Number.isFinite(numOr(i.health_score, NaN))
+        ? Math.min(5, Math.max(0, Math.round(numOr(i.health_score))))
+        : null
+    }));
+}
+
+app.post('/analyze', requireAuth, rateLimit('/analyze'), upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
 
@@ -726,8 +867,19 @@ app.post('/analyze', requireAuth, upload.single('image'), rateLimit('/analyze'),
 
     // From here on the scan is paid for. Any failure below must hand it
     // back, so a Gemini error never burns a user's allowance.
-    const refundScan = () => {
-      if (reservation) releaseScan({ uid: id.uid, identifier: id.identifier, day: ent.scan_day });
+    //
+    // AWAITED, deliberately: on a serverless host the function is frozen the
+    // moment the response is sent, and an un-awaited refund is simply lost —
+    // which is exactly the "paid for a photo that failed" bug the refund was
+    // added to prevent. The write is a single transaction, so the wait is
+    // milliseconds.
+    const refundScan = async () => {
+      if (!reservation) return;
+      try {
+        await releaseScan({ uid: id.uid, identifier: id.identifier, day: ent.scan_day });
+      } catch (e) {
+        console.error('Scan refund failed:', e.message);
+      }
     };
 
     let json;
@@ -742,21 +894,26 @@ app.post('/analyze', requireAuth, upload.single('image'), rateLimit('/analyze'),
 {
   "description": "brief summary of what was detected",
   "confidence": estimated accuracy 0-1,
+  "total_grams": REAL edible weight of ALL food PHYSICALLY VISIBLE in THIS photo, in grams (number). Never a nutrition-per-100 g figure and never a round default: weigh the actual items (ONE whole egg ≈ 55 g; TWO boiled eggs ≈ 110 g),
   "dishes": [
     {
       "name": "accurate food name in English",
-      "portion_description": "estimated portion like '1 small bowl' or '1 slice (80g)'",
+      "portion_description": "estimated portion like '1 small bowl' or '1 slice (80g)' (for a single food say how many, e.g. '1 whole egg (55g)')",
       "calories_per_100g": integer,
       "protein_g_per_100g": number,
       "carbs_g_per_100g": number,
       "fats_g_per_100g": number,
       "fiber_g_per_100g": number,
       "sugar_g_per_100g": number,
-      "suitable_for": "bulk"/"diet"/"both"
+      "suitable_for": "bulk"/"diet"/"both",
+      "grams": REAL edible weight of THIS dish ALONE as seen in THIS photo (number) — count the items and scale from visible references (a hand, a plate, a bowl): ONE whole egg ≈ 55 g, ONE small roti ≈ 40 g, ONE banana ≈ 105 g, ONE small bowl of dal ≈ 150 g,
+      "ingredients": [
+        { "name": "component VISIBLE in THIS photo, e.g. Chicken egg", "grams": its real weight in grams (number), "health_score": integer 0-5 for that component }
+      ]
     }
   ]
 }
-Rules: 1 dish entry per visible item. Be specific about the portion. Use standard nutrition data. If unsure, name the most likely food rather than guessing an Indian equivalent. Return ONLY raw JSON. No markdown. No backticks.` },
+Rules: 1 dish entry per visible item. Be specific about the portion. Weights must describe THIS photo: total_grams is the sum of every visible item's real weight and each dish's grams is that dish alone — estimate them item by item from what you can SEE (ONE whole egg ≈ 55 g, TWO whole eggs ≈ 110 g, ONE small roti ≈ 40 g, ONE small bowl of dal ≈ 150 g); never report a nutrition per-100 g weight and never a guessed round default such as 100 g. Nutrition data (per 100 g) stays standard. For each dish, grams must be that dish alone and ingredients must list ONLY the components physically visible in THIS photo: a single-item food has exactly ONE ingredient (one egg = one "Chicken egg"; one banana = one "Banana"), so list 1–8 of them, never split one food into several ingredients and never add anything you cannot see in the photo — no guesses, no classical recipes, no other egg varieties. A duck egg appears only when a duck egg is truly in the photo. Component weights must sum to roughly the dish's grams. health_score rewards protein, fibre and vegetables and penalises added sugar, deep frying and very high fat. If you cannot see individual components, return an empty ingredients array. If unsure, name the most likely food rather than guessing an Indian equivalent. Return ONLY raw JSON. No markdown. No backticks.` },
             { inlineData: { mimeType: 'image/jpeg', data: base64 } }
           ]
         }]
@@ -775,7 +932,7 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
     } catch (e) {
       // The analysis failed AFTER the scan was reserved — hand it back so a
       // Gemini/parse error never costs the user an allowance.
-      refundScan();
+      await refundScan();
       throw e;
     }
 
@@ -785,35 +942,44 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
     let scansUsed = reservation ? reservation.used : ent.scans_used;
     let scansLimit = ent.subscribed ? null : SCAN_LIMIT_FREE;
 
-    let dishes = json.dishes;
-    if (!dishes || !Array.isArray(dishes) || dishes.length === 0) {
-      dishes = [{
-        name: json.meal_name || 'Unknown',
-        portion_description: json.portion_description || '',
-        calories_per_100g: json.calories_per_100g ?? json.calories ?? 0,
-        protein_g_per_100g: json.protein_g_per_100g ?? json.protein_g ?? 0,
-        carbs_g_per_100g: json.carbs_g_per_100g ?? json.carbs_g ?? 0,
-        fats_g_per_100g: json.fats_g_per_100g ?? json.fats_g ?? 0,
-        fiber_g_per_100g: json.fiber_g_per_100g ?? json.fiber_g ?? 0,
-        sugar_g_per_100g: json.sugar_g_per_100g ?? 0,
-        suitable_for: json.suitable_for || 'both'
-      }];
+    // A single dish is the common case; a model that returns a non-array (or
+    // an array of junk) falls back to the flat top-level shape, which older
+    // prompts produced.
+    let dishes = Array.isArray(json.dishes)
+      ? json.dishes.filter((d) => d && typeof d === 'object').slice(0, MAX_DISHES)
+      : [];
+    if (dishes.length === 0) {
+      dishes = [{ ...json, name: json.meal_name || json.name }];
     }
 
+    // Total edible weight of EVERYTHING visible — the app uses it as the
+    // starting serving, so one egg opens at ~55 g instead of a fixed 100 g.
+    // The model's total wins; without one, the per-dish weights are summed;
+    // 100 g preserves the old behaviour when neither was sent. Clamped so a
+    // wild AI number can't wreck the log.
+    const normalizedDishes = dishes.map((d) => {
+      const ingredients = normalizeIngredients(d.ingredients);
+      return {
+        name: cleanText(d.name, 'Unknown'),
+        portion_description: cleanText(d.portion_description, '', 80),
+        ...macrosFrom(d),
+        suitable_for: cleanSuitableFor(d.suitable_for),
+        // Per-dish weight and component list (see the prompt above). Both are
+        // optional: an older prompt, or a photo where the components cannot be
+        // told apart, sends nothing and the app falls back to the dish itself.
+        // When the dish has no weight of its own but its components do, the
+        // components' sum is the dish — a single "one egg" scan stays one egg.
+        grams: dishGramsFrom(d, ingredients),
+        ingredients,
+      };
+    });
+    const totalGrams = totalGramsFrom(json, normalizedDishes) || 100;
+
     const normalized = {
-      description: json.description || '',
-      confidence: json.confidence ?? 0.7,
-      dishes: dishes.map(d => ({
-        name: d.name || 'Unknown',
-        portion_description: d.portion_description || '',
-        calories_per_100g: d.calories_per_100g ?? d.calories ?? 0,
-        protein_g_per_100g: d.protein_g_per_100g ?? d.protein_g ?? 0,
-        carbs_g_per_100g: d.carbs_g_per_100g ?? d.carbs_g ?? 0,
-        fats_g_per_100g: d.fats_g_per_100g ?? d.fats_g ?? 0,
-        fiber_g_per_100g: d.fiber_g_per_100g ?? d.fiber_g ?? 0,
-        sugar_g_per_100g: d.sugar_g_per_100g ?? 0,
-        suitable_for: d.suitable_for || 'both'
-      })),
+      description: cleanText(json.description, '', 200),
+      confidence: clampRange(json.confidence, 0, 1, 0.7),
+      grams: totalGrams,
+      dishes: normalizedDishes,
       scans_used: scansUsed,
       scans_limit: scansLimit,
       scans_remaining: scansLimit == null ? null : Math.max(0, scansLimit - scansUsed),
@@ -837,7 +1003,13 @@ Rules: 1 dish entry per visible item. Be specific about the portion. Use standar
       const unidentified =
         normalized.confidence < 0.5 ||
         normalized.dishes.some((d) => String(d.name || '').toLowerCase() === 'unknown');
-      if (unidentified) {
+      // Refunds are budgeted per account per day (REFUND_CAP_PER_DAY): the
+      // first few unidentified shots are free, after that they count, which
+      // is what stops one account from feeding us non-food photos forever.
+      const withinBudget = unidentified
+        ? await takeRefundBudget({ uid: id.uid, day: ent.scan_day })
+        : false;
+      if (withinBudget) {
         await releaseScan({ uid: id.uid, identifier: id.identifier, day: ent.scan_day });
         const used = Math.max(0, reservation.used - 1);
         reservation = null;
@@ -1085,19 +1257,6 @@ app.post('/referral/generate', requireAuth, async (req, res) => {
   }
 });
 
-// Phase 2: the identifier is out of the URL. The old path still answers (its
-// param is ignored) so already-installed app versions keep working, but the
-// code returned is always the token owner's.
-app.get('/referral/my-code/:phone', requireAuth, async (req, res) => {
-  try {
-    const identifier = identityOf(req).identifier;
-    if (!identifier) return res.status(400).json({ error: 'Identity required' });
-    res.json({ referral_code: await getOrCreateReferralCode(identifier) });
-  } catch (e) {
-    return sendFailure(req, res, e);
-  }
-});
-
 app.get('/me/referral-code', requireAuth, async (req, res) => {
   try {
     const identifier = identityOf(req).identifier;
@@ -1129,7 +1288,7 @@ app.get('/me/referral-code', requireAuth, async (req, res) => {
 const REFERRAL_PRO_DAYS = 30;
 
 // Later of two Pro end dates — extending a Pro window must never shorten one
-// the user already has (paid, trial, or an earlier referral).
+// the user already has (paid, an earlier referral, ...).
 function laterOfProUntil(a, b) {
   const ta = Date.parse(a || '') || 0;
   const tb = Date.parse(b || '') || 0;
@@ -1201,6 +1360,7 @@ app.post('/referral/apply', requireAuth, async (req, res) => {
         tx.set(myRef, {
           referredBy: upper,
           pro_until: laterOfProUntil(mine.pro_until, proUntil),
+          pro_until_at: new Date(laterOfProUntil(mine.pro_until, proUntil)),
         }, { merge: true });
 
         // The referrer is rewarded only once the invitee has actually
@@ -1209,7 +1369,11 @@ app.post('/referral/apply', requireAuth, async (req, res) => {
           const theirRef = db.collection('users').doc(referrerUid);
           const theirDoc = await tx.get(theirRef);
           const theirs = (theirDoc.exists ? theirDoc.data() : {}) || {};
-          tx.set(theirRef, { pro_until: laterOfProUntil(theirs.pro_until, proUntil) }, { merge: true });
+          const referrerProUntil = laterOfProUntil(theirs.pro_until, proUntil);
+          tx.set(theirRef, {
+            pro_until: referrerProUntil,
+            pro_until_at: new Date(referrerProUntil),
+          }, { merge: true });
         }
       });
       if (alreadyUsed) return res.status(400).json({ error: 'Already used a referral code' });
@@ -1331,7 +1495,8 @@ app.post('/meals/sync', requireAuth, async (req, res) => {
 // '/habits/list' call anywhere. They were dead, so they are removed.
 
 // ─── Razorpay: Create Recurring Subscription ───────────────────────────────
-// Real ₹29/month recurring billing: creates a Razorpay Subscription (auto-
+// Real ₹49/month recurring billing (first month ₹0): creates a Razorpay
+// Subscription (auto-
 // charges every month) instead of a one-time order. The app opens checkout
 // with the returned subscription_id; Razorpay then charges the customer
 // automatically each billing cycle and fires webhooks we verify below.
@@ -1362,6 +1527,20 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
       return res.status(500).json({ error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env' });
     }
 
+    // One auto-charging subscription per account. Razorpay happily creates a
+    // second one, so without this a second device (or a second tap after a
+    // slow network) begins billing the same person twice — and nothing in the
+    // app would show it until the statement arrived. With the free trial
+    // gone, no skipped path remains: any subscribed account is told
+    // "already subscribed" instead of being double-billed.
+    const ent = await entitlementsFor(id);
+    if (ent.subscribed) {
+      return res.status(409).json({
+        error: 'already_subscribed',
+        message: 'This account already has an active Pro subscription.',
+      });
+    }
+
     const planId = await getPlanId();
 
     // Attach a Razorpay customer so the hosted payment page prefills the
@@ -1387,8 +1566,19 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
     }
 
     const subscription = await razorpay.subscriptions.create({
+      // FIRST MONTH FREE (₹0): billing starts 30 days out. This is Razorpay's
+      // documented way to defer the first charge — during those 30 days the
+      // customer only AUTHORIZES the ₹49/month autopay mandate at checkout
+      // (plus a tiny auto-refunded token payment); the first ₹49 charge
+      // happens at/start of the future cycle, reported by
+      // subscription.activated / subscription.charged via the webhook below.
+      start_at: Math.floor((Date.now() + FIRST_MONTH_FREE_DAYS * 24 * 60 * 60 * 1000) / 1000),
       plan_id: planId,
-      total_count: 12, // 12 monthly auto-renewing charges
+      // Razorpay stops charging after total_count cycles, so 12 silently
+      // ended Pro (and the billing) one year after signup. 100 is Razorpay's
+      // own maximum — effectively open-ended — and the webhook still reacts to
+      // `halted`/`cancelled`, so a failed card ends the subscription properly.
+      total_count: 100,
       customer_notify: 1,
       ...(customerId ? { customer_id: customerId } : {}),
       // NOTE: do NOT pass an inline `customer` block here — Razorpay's
@@ -1409,11 +1599,15 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
       [subscription.id, phone, subscription.status || 'created']
     );
     try {
-      const fUid = await firestore.resolveUid(phone);
+      // The token's uid first: resolveUid(phone) is a lookup that misses for an
+      // email identity (or a number Firebase does not hold), and this mapping
+      // is what /payment/verify trusts to decide who owns the payment.
+      const fUid = id.uid || (await firestore.resolveUid(phone));
       await firestore.set(
         'subscriptions/' + subscription.id,
         {
           uid: fUid || null,
+          identifier: phone,
           phone: phone,
           status: subscription.status || 'created',
           updatedAt: new Date(),
@@ -1424,8 +1618,15 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
 
     res.json({
       subscription_id: subscription.id,
-      amount: 2900,
+      amount: 4900, // what auto-charges once the free first month is over
       currency: 'INR',
+      // Month 1 costs nothing, but the ₹49 autopay mandate is approved now.
+      first_month_free: true,
+      first_month_free_days: FIRST_MONTH_FREE_DAYS,
+      first_charge_at:
+        subscription.start_at
+          ? new Date(subscription.start_at * 1000).toISOString()
+          : null,
       razorpay_key: process.env.RAZORPAY_KEY_ID,
     });
   } catch (e) {
@@ -1468,79 +1669,180 @@ app.post('/payment/verify', requireAuth, async (req, res) => {
       .update(body)
       .digest('hex');
 
-    if (expectedSignature !== razorpay_signature) {
+    // Timing-safe, like the webhook: `!==` on two strings returns at the first
+    // differing byte, which leaks how much of a forged signature was correct
+    // to anyone who can time the response.
+    const expectedBuf = Buffer.from(expectedSignature, 'hex');
+    const receivedBuf = Buffer.from(
+      typeof razorpay_signature === 'string' ? razorpay_signature : '',
+      'hex'
+    );
+    if (
+      receivedBuf.length !== expectedBuf.length ||
+      !crypto.timingSafeEqual(receivedBuf, expectedBuf)
+    ) {
       return res.status(400).json({ error: 'Invalid signature' });
     }
 
-    // Fetch the payment to get the phone from order notes
+    const id = identityOf(req);
     const payment = await razorpay.payments.fetch(razorpay_payment_id);
-    const phone = payment.notes?.phone;
+
+    // ── Who owns this payment? ──────────────────────────────────────────
+    // This used to REQUIRE payment.notes.phone and answer 400 without it.
+    // Razorpay does not reliably copy a subscription's notes onto its
+    // payments, so real subscription payments could be rejected before the
+    // webhook ever got a chance to activate them.
+    //
+    // Sources, most trustworthy first:
+    //   1. our own subscriptions/{id} document, written by
+    //      create-subscription from the VERIFIED token — it holds uid + phone;
+    //   2. the payment's own notes (the legacy order flow puts the phone here);
+    //   3. the subscription object, whose notes we set at creation.
+    // The token's identity is the last resort: it is verified, and the
+    // signature check above already proved the payment is genuine.
+    let ownerPhone = null;
+    let ownerUid = null;
+    if (razorpay_subscription_id) {
+      const mapping = await firestore.get(
+        'subscriptions/' + razorpay_subscription_id
+      );
+      if (mapping) {
+        if (typeof mapping.uid === 'string' && mapping.uid) ownerUid = mapping.uid;
+        if (typeof mapping.identifier === 'string' && mapping.identifier) {
+          ownerPhone = mapping.identifier;
+        } else if (typeof mapping.phone === 'string' && mapping.phone) {
+          ownerPhone = mapping.phone;
+        }
+      }
+    }
+    if (!ownerPhone && typeof payment.notes?.phone === 'string' && payment.notes.phone) {
+      ownerPhone = payment.notes.phone;
+    }
+    if (!ownerPhone && payment.subscription_id) {
+      try {
+        const sub = await razorpay.subscriptions.fetch(payment.subscription_id);
+        if (typeof sub?.notes?.phone === 'string' && sub.notes.phone) {
+          ownerPhone = sub.notes.phone;
+        }
+      } catch (e) {
+        console.warn(
+          'Could not read subscription ' + payment.subscription_id + ':',
+          e.message
+        );
+      }
+    }
+
+    const phone = ownerPhone || id.identifier;
     if (!phone) {
-      console.error('Could not determine phone from payment notes', { payment_id: razorpay_payment_id });
+      console.error('Could not determine the owner of payment', {
+        payment_id: razorpay_payment_id,
+        subscription_id: razorpay_subscription_id || null,
+      });
       return res.status(400).json({ error: 'Could not identify user for this payment' });
     }
 
-    // The subscription was created for a specific account; only that account
-    // may verify it. (notes.phone comes from Razorpay, written by
-    // create-subscription from the verified token — not from this request.)
-    const id = identityOf(req);
-    if (id.identifier && phone !== id.identifier) {
+    // Only the account that paid may verify this payment. The uid from our own
+    // mapping is definitive; the identifier comparison is the fallback for a
+    // subscription created before that mapping existed. When the mapping names
+    // the caller, a different identifier must NOT lock them out (the same
+    // person can have both a phone and an email identity).
+    const foreignByUid = !!(ownerUid && id.uid && ownerUid !== id.uid);
+    const foreignById = !!(
+      !ownerUid &&
+      ownerPhone &&
+      id.identifier &&
+      ownerPhone !== id.identifier
+    );
+    if (foreignByUid || foreignById) {
       return res.status(403).json({ error: 'Payment does not belong to this account' });
     }
 
-    // Store payment in database
-    try {
-      await dbq(
+    // Where the activation actually landed. A response of success:true means
+    // "you are Pro", and the app unlocks Pro locally on it — so it may only be
+    // sent when a store really recorded the subscription.
+    let activatedIn = null;
+
+    // Postgres rows are keyed by the identifier and only exist where Postgres
+    // is configured; dbq() is a silent no-op without it.
+    if (dbAvailable) {
+      const p = await dbq(
         `INSERT INTO payments (phone, transaction_ref, amount, status)
          VALUES ($1, $2, $3, 'approved')`,
-        [phone, razorpay_payment_id, (payment.amount || 2900) / 100]
+        [phone, razorpay_payment_id, (payment.amount || 4900) / 100]
       );
-    } catch (e) {
-      console.error('Payment insert failed:', e.message);
-    }
-
-    // Activate subscription
-    await dbq(
-      'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true',
-      [phone]
-    );
-
-    // Save the active subscription id on the user row
-    if (razorpay_subscription_id) {
-      try {
-        await dbq(
-          'UPDATE users SET subscription_id = $1 WHERE phone = $2',
-          [razorpay_subscription_id, phone]
-        );
-      } catch (e) {
-        console.error('subscription_id save failed:', e.message);
+      if (p._failed) {
+        console.error('Payment insert failed for', razorpay_payment_id);
+      }
+      const u = await dbq(
+        'INSERT INTO users (phone, subscribed) VALUES ($1, true) ON CONFLICT (phone) DO UPDATE SET subscribed = true',
+        [phone]
+      );
+      if (!u._failed) activatedIn = 'postgres';
+      if (razorpay_subscription_id) {
+        try {
+          await dbq(
+            'UPDATE users SET subscription_id = $1 WHERE phone = $2',
+            [razorpay_subscription_id, phone]
+          );
+        } catch (e) {
+          console.error('subscription_id save failed:', e.message);
+        }
       }
     }
 
-    // Firestore mirror: activation + subscription + payment records
-    // (best-effort — Postgres stays authoritative in Phase 1).
-    {
-      const fUid = await firestore.resolveUid(phone);
-      if (fUid) {
-        await firestore.set('users/' + fUid, { subscribed: true, subscriptionId: razorpay_subscription_id || null }, { merge: true });
-        if (razorpay_subscription_id) {
-          await firestore.set('subscriptions/' + razorpay_subscription_id, {
-            uid: fUid,
-            identifier: phone,
-            status: 'active',
-            createdAt: new Date(),
-          }, { merge: true });
-        }
-        await firestore.set('payments/' + razorpay_payment_id, {
+    // Firestore is the source of truth in production, and its docs are keyed
+    // by the Firebase UID. That UID comes from the VERIFIED TOKEN — not from
+    // resolveUid(payment.notes.phone), which returns null for an email login
+    // or a number Firebase does not know. That miss used to skip activation
+    // entirely while the response still said success:true, so a paying user
+    // stayed on the free tier and nothing anywhere recorded a failure.
+    const fUid = ownerUid || id.uid || (await firestore.resolveUid(phone));
+    if (fUid && firestore.isEnabled()) {
+      const userDocs = await firestore.set(
+        'users/' + fUid,
+        { subscribed: true, subscriptionId: razorpay_subscription_id || null },
+        { merge: true }
+      );
+      if (userDocs) activatedIn = 'firestore';
+      // The subscription/payment records are audit trail, not activation, so
+      // they do not decide the response.
+      if (razorpay_subscription_id) {
+        await firestore.set('subscriptions/' + razorpay_subscription_id, {
           uid: fUid,
           identifier: phone,
-          transactionRef: razorpay_payment_id,
-          amount: (payment.amount || 2900) / 100,
-          status: 'approved',
+          status: 'active',
           createdAt: new Date(),
         }, { merge: true });
       }
+      await firestore.set('payments/' + razorpay_payment_id, {
+        uid: fUid,
+        identifier: phone,
+        transactionRef: razorpay_payment_id,
+        amount: (payment.amount || 4900) / 100,
+        status: 'approved',
+        createdAt: new Date(),
+      }, { merge: true });
     }
+
+    if (!activatedIn) {
+      console.error('Payment verified but not persisted', {
+        payment_id: razorpay_payment_id,
+        uid: id.uid || null,
+        firestore: firestore.isEnabled(),
+        postgres: dbAvailable,
+      });
+      // 202 (not 5xx): the money DID go through, and the webhook may still
+      // activate the account. The client shows "payment received, Pro will
+      // activate shortly" instead of pretending everything is fine.
+      return res.status(202).json({
+        error: 'activation_pending',
+        message:
+          'Payment received but the subscription could not be saved yet. ' +
+          'It will activate automatically; quote this payment id to support if it does not.',
+        payment_id: razorpay_payment_id,
+      });
+    }
+
     res.json({ success: true, subscribed: true });
   } catch (e) {
     return sendFailure(req, res, e);
@@ -1777,14 +2079,14 @@ app.get('/me/entitlements', requireAuth, async (req, res) => {
 // trial after an app update.
 app.get('/trial/status', requireAuth, async (req, res) => {
   try {
-    // Query params are ignored — the trial reported is always the caller's.
+    // FREE TRIALS ARE REMOVED — for existing and new users alike. The endpoint
+    // still answers so older installed app versions receive a clean "no
+    // trial" answer and drop their stored countdown (the server's no-trial
+    // verdict is authoritative) instead of erroring on the removed grant.
+    // The owner/admin account is the only always-free Pro tier.
     const id = identityOf(req);
-    const identifier = id.identifier;
-    if (!identifier) return res.status(400).json({ error: 'Identity required' });
-    if (isAdminUser(identifier, id.emailVerified)) return res.json({ admin: true, active: false, daysLeft: 0 });
-    const startedAt = await getOrGrantTrial(identifier);
-    if (!startedAt) return res.json({ active: false, expired: false, daysLeft: 0 });
-    res.json(trialState(startedAt));
+    if (isAdminUser(id)) return res.json({ admin: true, active: false, daysLeft: 0 });
+    res.json({ active: false, expired: false, daysLeft: 0 });
   } catch (e) {
     return sendFailure(req, res, e);
   }
@@ -1795,9 +2097,9 @@ app.get('/trial/status', requireAuth, async (req, res) => {
 // Wipes ALL of the user's data (Postgres + Firestore) but keeps a tombstone
 // that remembers the identifier (phone/email) AND the original trial start.
 // That tombstone is what prevents a delete -> re-login -> fresh free-trial
-// loop: getOrGrantTrial() checks it first and never re-grants. The user can
-// sign up again with the same phone/email, but they will NOT get another
-// free trial.
+// that remembers the identifier (phone/email) — never wiped.
+// The free trial no longer exists, so the tombstone's trial fields only
+// matter as historical bookkeeping; nothing re-grants off them.
 app.post('/account/delete', requireAuth, async (req, res) => {
   try {
     // You can only delete the account you are signed in as.
@@ -1806,7 +2108,7 @@ app.post('/account/delete', requireAuth, async (req, res) => {
     const email = id.email;
     const identifier = phone || email;
     if (!identifier) return res.status(400).json({ error: 'Identity required' });
-    if (isAdminUser(identifier, id.emailVerified)) return res.status(403).json({ error: 'Admin account cannot be deleted' });
+    if (isAdminUser(id)) return res.status(403).json({ error: 'Admin account cannot be deleted' });
 
     // 1) Capture the original trial start BEFORE wiping anything.
     let trialStartedAt = null;
@@ -1873,7 +2175,7 @@ app.post('/account/delete', requireAuth, async (req, res) => {
     //    its trial marker now lives on in the tombstone.
     if (fUid && firestore.isEnabled()) {
       const db = firestore.getDb();
-      for (const col of ['habitData', 'dietProfiles', 'recentFoods', 'userPreferences', 'recipes']) {
+      for (const col of ['habitData', 'dietProfiles', 'recentFoods', 'userPreferences']) {
         await firestore.del(col + '/' + fUid);
       }
       // meals where uid matches (docs keyed by meal id)
@@ -2071,10 +2373,11 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
     const phone = id.phone || id.identifier;
     const email = id.email;
     if (!phone && !email) return res.status(400).json({ error: 'Identity required' });
-    const identifier = phone || email;
+    // resolveUid() looks the account up in userIndex by its primary identifier.
+    const identifier = id.identifier || email || phone;
 
-    // The owner is always subscribed.
-    if (isAdminUser(identifier, id.emailVerified)) return res.json({ subscribed: true });
+    // The owner is always subscribed (custom claim, never an email match).
+    if (isAdminUser(id)) return res.json({ subscribed: true });
 
     // Firestore is the source of truth (Phase 3) — check users/{uid} first.
     const fUid = await firestore.resolveUid(identifier);
@@ -2082,17 +2385,25 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
       try {
         const doc = await firestore.getDb().collection('users').doc(fUid).get();
         if (doc.exists && doc.data().subscribed === true) {
-          return res.json({ subscribed: true });
+          // pro_until rides along so the app can show the end date.
+          return res.json({
+            subscribed: true,
+            ...(doc.data().pro_until ? { pro_until: doc.data().pro_until } : {}),
+          });
         }
         // A referral's 30-day window counts as Pro until pro_until passes.
         if (doc.exists && proUntilActive(doc.data().pro_until)) {
-          return res.json({ subscribed: true, pro_until: doc.data().pro_until });
+          const proUntil = doc.data().pro_until;
+          if (!doc.data().pro_until_at) {
+            await firestore.set('users/' + fUid, {
+              pro_until_at: new Date(proUntil),
+            }, { merge: true });
+          }
+          return res.json({ subscribed: true, pro_until: proUntil });
         }
-        // An active 30-day free trial counts as Pro until it expires.
-        if (doc.exists) {
-          const ts = trialState(doc.data().trial_started_at);
-          if (ts.active) return res.json({ subscribed: true, trial_days_left: ts.daysLeft, trial_ends_at: ts.endsAt });
-        }
+        // The old 30-day free trial no longer applies to anyone — a stored
+        // trial_started_at on an old doc is ignored here, exactly like in
+        // entitlementsFor(). Only a paid/referral/admin account is Pro.
       } catch (_) {}
     }
 
@@ -2106,10 +2417,13 @@ app.get('/subscription/status', requireAuth, async (req, res) => {
       const r = await dbq('SELECT subscribed, pro_until FROM users WHERE email = $1 LIMIT 1', [email]);
       user = r.rows[0] || null;
     }
-    if (user?.subscribed) return res.json({ subscribed: true });
+    if (user?.subscribed) {
+      return res.json({
+        subscribed: true,
+        ...(user.pro_until ? { pro_until: user.pro_until } : {}),
+      });
+    }
     if (proUntilActive(user && user.pro_until)) return res.json({ subscribed: true, pro_until: user.pro_until });
-    const ts = await pgTrial(identifier);
-    if (ts.active) return res.json({ subscribed: true, trial_days_left: ts.daysLeft, trial_ends_at: ts.endsAt });
     res.json({ subscribed: false });
   } catch (e) {
     return sendFailure(req, res, e);
@@ -2128,10 +2442,24 @@ if (require.main === module) {
       '(override with GEMINI_MODEL / GEMINI_API_VERSION)'
   );
   app.listen(port, () => console.log(`MacroSnap server on port ${port}`));
+  // Make sure the owner's `admin` claim exists (no-op without ADMIN_EMAIL).
+  // On serverless hosts the first-request middleware above does this instead.
+  startAdminClaimOnce();
 }
 
 module.exports = app;
-// Exposed so the test harness can reset the per-user rate-limit counters
-// between tests (they live in module scope and would otherwise carry over).
-module.exports._resetRateLimits = resetRateLimits;
 module.exports._rateLimits = RATE_WINDOWS;
+// Test hook: the pure AI-output sanitizers. They are the only thing standing
+// between a hallucinated "250 kcal" and a result card that throws, so they are
+// unit-tested directly (test/scan_output.test.js).
+module.exports._scanSanitizers = {
+  numOr,
+  clampRange,
+  cleanText,
+  cleanSuitableFor,
+  macrosFrom,
+  clampGrams,
+  normalizeIngredients,
+  dishGramsFrom,
+  totalGramsFrom,
+};

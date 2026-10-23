@@ -11,8 +11,9 @@
 // Enable by setting ONE of:
 //   FIREBASE_SERVICE_ACCOUNT_JSON  - full service-account JSON as an env var
 //   GOOGLE_APPLICATION_CREDENTIALS - path to the service-account JSON file
-// If neither is set, dual-write is disabled (logged once) and the app keeps
-// working exactly as before.
+// If neither is set, Firestore-backed features that require shared state
+// (including Gemini rate limits) fail closed; legacy Postgres-backed paths
+// can still operate where configured.
 //
 // firebase-admin is required lazily inside init() so that even a missing
 // package can never crash the server at boot - a disabled Firestore must be
@@ -107,6 +108,21 @@ async function resolveUid(identifier) {
   }
 }
 
+// ─── safe read helper (never throws) ────────────────────────────────────
+// Returns the document data, or null when it is missing, Firestore is off, or
+// the read failed. Callers use it for records written by this server (the
+// subscriptions/{id} owner mapping) where a miss must degrade, not 500.
+async function get(path) {
+  if (!isEnabled()) return null;
+  try {
+    const doc = await db.doc(path).get();
+    return doc.exists ? doc.data() || null : null;
+  } catch (e) {
+    console.error('Firestore get ' + path + ' failed:', e.message);
+    return null;
+  }
+}
+
 // ─── safe write helpers (never throw) ────────────────────────────────────
 async function set(path, data, opts) {
   if (!isEnabled()) return false;
@@ -141,4 +157,4 @@ function getAdmin() {
   return admin;
 }
 
-module.exports = { init, isEnabled, resolveUid, set, del, getDb, getAdmin };
+module.exports = { init, isEnabled, resolveUid, get, set, del, getDb, getAdmin };

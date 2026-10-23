@@ -19,6 +19,11 @@ const firestoreStub = {
   isEnabled: () => true,
   resolveUid: async (id) =>
     id && typeof id === 'string' ? uidMap[id.toLowerCase()] || null : null,
+  // Reads a doc from the fake, like the real firestore.get(): data or null.
+  get: async (path) => {
+    const [col, id] = path.split('/');
+    return (fsDocs[col] || {})[id] || null;
+  },
   set: async (path, data, opts) => {
     fsSets.push({ path, data, opts });
     const [col, id] = path.split('/');
@@ -76,6 +81,10 @@ class RazorpayStub {
       },
     };
     this.subscriptions = {
+      fetch: async (id) =>
+        razorpayState.subscriptionsFetch
+          ? razorpayState.subscriptionsFetch(id)
+          : { id, status: 'active', notes: {} },
       create: async (payload) => {
         razorpayState.lastCreate = payload;
         if (razorpayState.subscriptionsCreate) {
@@ -153,6 +162,7 @@ function resetState() {
   for (const k of Object.keys(uidMap)) delete uidMap[k];
   razorpayState.lastCreate = null;
   razorpayState.subscriptionsCreate = null;
+  razorpayState.subscriptionsFetch = null;
   razorpayState.paymentsFetch = null;
 }
 beforeEach(resetState);
@@ -167,7 +177,7 @@ function sign(body, secret = process.env.RAZORPAY_WEBHOOK_SECRET) {
 // covering handler logic. The middleware itself — missing/invalid tokens, the
 // 401s and the "client identifiers are ignored" rule — is covered by
 // test/auth.test.js.
-function actAs(req, identifier) {
+function actAs(req, identifier, adminClaim) {
   req.user = identifier
     ? {
         uid:
@@ -177,17 +187,19 @@ function actAs(req, identifier) {
           ? String(identifier).toLowerCase()
           : undefined,
         // Google sign-in always arrives verified; phone/uid-only identities
-        // carry no email claim, so they read as unverified. The admin Pro
-        // override requires this flag (see isAdminUser).
+        // carry no email claim, so they read as unverified.
         email_verified: String(identifier).includes('@'),
         phone_number: String(identifier).includes('@') ? undefined : String(identifier),
+        // The owner's privilege is this custom claim and nothing else — see
+        // ensureAdminClaim() in server.js.
+        ...(adminClaim === true ? { admin: true } : {}),
       }
     : null;
   return req;
 }
 // `as` forces the TOKEN's identity (independently of what the body claims) —
 // that is how the "client-sent identifiers are ignored" cases are written.
-function makeReq(body, { sig, query, as } = {}) {
+function makeReq(body, { sig, query, as, admin } = {}) {
   const req = { body: body || {}, query: query || {} };
   req.headers = {};
   if (sig !== undefined) req.headers['x-razorpay-signature'] = sig;
@@ -196,7 +208,7 @@ function makeReq(body, { sig, query, as } = {}) {
   const q = req.query;
   const identifier =
     as !== undefined ? as : b.phone || b.email || q.phone || q.email || null;
-  return actAs(req, identifier);
+  return actAs(req, identifier, admin);
 }
 function makeRes() {
   const res = { statusCode: 200, body: undefined };
@@ -321,7 +333,9 @@ test('create-subscription: the TOKEN identity is used — a client-sent phone/em
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.subscription_id, 'sub_test_1');
   assert.equal(res.body.razorpay_key, 'rzp_test_key');
-  assert.equal(razorpayState.lastCreate.total_count, 12);
+  // 100 cycles, not 12: Razorpay stops charging at total_count, so 12 quietly
+  // ended Pro (and the renewal) exactly one year after signup.
+  assert.equal(razorpayState.lastCreate.total_count, 100);
   // The subscription is mapped to the signed-in user, not to the body's phone.
   assert.equal(razorpayState.lastCreate.notes.phone, 'spandana@example.com');
   assert.equal(razorpayState.lastCustomer.name, 'Spandana');
@@ -399,6 +413,30 @@ test('create-subscription: Razorpay rejection → generic 500, internals logged 
   assert.ok(logged.some((l) => l.includes('max_retries')), 'the real error must be logged server-side');
 });
 
+// Razorpay will happily create a second auto-charging subscription for the
+// same person, so the guard has to be here or the user is billed twice.
+test('create-subscription: an active subscription is refused with 409', async () => {
+  uidMap['pro@example.com'] = 'uid_pro';
+  fsDocs.users = { uid_pro: { subscribed: true } };
+  const res = makeRes();
+  await createSubscription(makeReq({}, { as: 'pro@example.com' }), res);
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.error, 'already_subscribed');
+  assert.equal(razorpayState.lastCreate, null, 'no second subscription may be created');
+});
+
+// A user in a free trial must still be able to pay before it ends.
+test('create-subscription: a user on trial may still subscribe', async () => {
+  uidMap['trial@example.com'] = 'uid_trial';
+  fsDocs.users = { uid_trial: { trial_started_at: new Date().toISOString() } };
+  const res = makeRes();
+  await createSubscription(makeReq({}, { as: 'trial@example.com' }), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.subscription_id, 'sub_test_1');
+});
+
 test('create-subscription: no verifiable identity → 400, no payment is created', async () => {
   const res = makeRes();
   await createSubscription(makeReq({ phone: '+919876543210' }, { as: null }), res);
@@ -426,6 +464,62 @@ test('verify: subscription signature is HMAC(payment_id|subscription_id)', async
   assert.equal(lastFsSet((s) => s.path === 'users/uid_pay').data.subscribed, true);
 });
 
+// The activation must use the TOKEN's uid. resolveUid(payment.notes.phone) is
+// only a fallback: it misses whenever the Firebase user was created by email
+// sign-in or by a number in another format, and that miss used to skip the
+// write entirely while still answering success:true.
+test('verify: activation writes the TOKEN uid even when the phone lookup misses', async () => {
+  razorpayState.paymentsFetch = async (id) => ({ id, amount: 2900, notes: { phone: 'brandnew@example.com' } });
+  const sig = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update('pay_new|sub_new')
+    .digest('hex');
+  const res = makeRes();
+  await verify(makeReq({
+    razorpay_subscription_id: 'sub_new',
+    razorpay_payment_id: 'pay_new',
+    razorpay_signature: sig,
+  }, { as: 'brandnew@example.com' }), res);
+
+  assert.equal(res.statusCode, 200);
+  const user = lastFsSet((s) => s.path === 'users/uid_brandnewexamplec');
+  assert.ok(user, 'the user doc must be written for the token uid');
+  assert.equal(user.data.subscribed, true);
+});
+
+// success:true means "you are Pro" in the app, so it may only be answered when
+// a store actually recorded the subscription.
+test('verify: nothing persisted → 202, never success', async () => {
+  razorpayState.paymentsFetch = async (id) => ({ id, amount: 2900, notes: { phone: 'ghost@example.com' } });
+  const sig = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update('pay_ghost|sub_ghost')
+    .digest('hex');
+
+  // No Postgres, and Firestore refusing the write — the exact DB-less state
+  // where the old code answered success:true after writing nothing.
+  const realIsEnabled = firestoreStub.isEnabled;
+  const realSet = firestoreStub.set;
+  firestoreStub.isEnabled = () => false;
+  firestoreStub.set = async () => false;
+  try {
+    const res = makeRes();
+    await verify(makeReq({
+      razorpay_subscription_id: 'sub_ghost',
+      razorpay_payment_id: 'pay_ghost',
+      razorpay_signature: sig,
+    }, { as: 'ghost@example.com' }), res);
+
+    assert.equal(res.statusCode, 202);
+    assert.equal(res.body.error, 'activation_pending');
+    assert.equal(res.body.payment_id, 'pay_ghost');
+    assert.notEqual(res.body.subscribed, true);
+  } finally {
+    firestoreStub.isEnabled = realIsEnabled;
+    firestoreStub.set = realSet;
+  }
+});
+
 test('verify: wrong signature order (subscription_id|payment_id) is rejected', async () => {
   razorpayState.paymentsFetch = async (id) => ({ id, amount: 2900, notes: { phone: 'pay@example.com' } });
   const sig = crypto
@@ -442,12 +536,95 @@ test('verify: wrong signature order (subscription_id|payment_id) is rejected', a
   assert.equal(res.body.error, 'Invalid signature');
 });
 
-// ── subscription/status ─────────────────────────────────────────────────
-test('subscription/status: admin is always subscribed', async () => {
+// Razorpay does not reliably copy a subscription's notes onto its payments, so
+// requiring payment.notes.phone answered 400 for real subscriptions — a paying
+// user told "could not identify user". Our own mapping is the fallback.
+test('verify: a payment with no notes verifies via our subscriptions mapping', async () => {
+  razorpayState.paymentsFetch = async (id) => ({ id, amount: 2900, notes: {} });
+  // The mapping is written from the token at create-subscription, so its uid
+  // IS the caller's uid — that is what makes it definitive.
+  uidMap['owner@example.com'] = 'uid_own';
+  fsDocs.subscriptions = {
+    sub_own: { uid: 'uid_own', identifier: 'owner@example.com' },
+  };
+  const sig = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update('pay_own|sub_own')
+    .digest('hex');
+
   const res = makeRes();
-  await subscriptionStatus(makeReq({}, { query: { phone: 'prabhasaaho213@gmail.com' } }), res);
+  await verify(makeReq({
+    razorpay_subscription_id: 'sub_own',
+    razorpay_payment_id: 'pay_own',
+    razorpay_signature: sig,
+  }, { as: 'owner@example.com' }), res);
+
+  assert.equal(res.statusCode, 200, 'a genuine payment must not be rejected');
+  assert.equal(res.body.subscribed, true);
+  assert.equal(lastFsSet((s) => s.path === 'users/uid_own').data.subscribed, true);
+});
+
+test('verify: no notes and no mapping falls back to the verified token', async () => {
+  razorpayState.paymentsFetch = async (id) => ({ id, amount: 2900, notes: {} });
+  const sig = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update('pay_bare|sub_bare')
+    .digest('hex');
+
+  const res = makeRes();
+  await verify(makeReq({
+    razorpay_subscription_id: 'sub_bare',
+    razorpay_payment_id: 'pay_bare',
+    razorpay_signature: sig,
+  }, { as: 'bare@example.com' }), res);
+
+  assert.equal(res.statusCode, 200);
+  const user = lastFsSet((s) => s.path === 'users/uid_bareexamplecom');
+  assert.equal(user.data.subscribed, true);
+});
+
+// The mapping names the owner, so a different signed-in account must not be
+// able to claim the payment — even though the signature is valid.
+test('verify: another account cannot verify a subscription it does not own', async () => {
+  razorpayState.paymentsFetch = async (id) => ({ id, amount: 2900, notes: {} });
+  fsDocs.subscriptions = {
+    sub_theirs: { uid: 'uid_theirs', identifier: 'them@example.com' },
+  };
+  const sig = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update('pay_theirs|sub_theirs')
+    .digest('hex');
+
+  const res = makeRes();
+  await verify(makeReq({
+    razorpay_subscription_id: 'sub_theirs',
+    razorpay_payment_id: 'pay_theirs',
+    razorpay_signature: sig,
+  }, { as: 'me@example.com' }), res);
+
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.body.error, 'Payment does not belong to this account');
+  assert.ok(!fsSets.some((s) => s.path.startsWith('users/')));
+});
+
+// ── subscription/status ─────────────────────────────────────────────────
+test('subscription/status: the admin CLAIM is always subscribed', async () => {
+  const res = makeRes();
+  await subscriptionStatus(
+    makeReq({}, { as: 'owner@example.com', admin: true }),
+    res
+  );
   assert.equal(res.statusCode, 200);
   assert.deepEqual(res.body, { subscribed: true });
+});
+
+// An address must not be a password: the same identity without the claim is an
+// ordinary free user, which is what closes the "register the owner's email" hole.
+test('subscription/status: an email alone is not the admin', async () => {
+  const res = makeRes();
+  await subscriptionStatus(makeReq({}, { as: 'owner@example.com' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.notDeepEqual(res.body, { subscribed: true });
 });
 
 test('subscription/status: Firestore users doc is authoritative', async () => {
@@ -462,6 +639,16 @@ test('subscription/status: nothing on record → not subscribed', async () => {
   const res = makeRes();
   await subscriptionStatus(makeReq({}, { query: { phone: 'nobody@example.com' } }), res);
   assert.deepEqual(res.body, { subscribed: false });
+});
+
+test('subscription/status: pro_until rides along so the app can show the end date', async () => {
+  uidMap['a@b.com'] = 'uid_a';
+  const until = new Date(Date.now() + 20 * 86400000).toISOString();
+  fsDocs.users = { uid_a: { subscribed: true, pro_until: until } };
+  const res = makeRes();
+  await subscriptionStatus(makeReq({}, { query: { phone: 'a@b.com' } }), res);
+  assert.equal(res.body.subscribed, true);
+  assert.equal(res.body.pro_until, until);
 });
 
 // ── user/profile (nickname restore) ─────────────────────────────────────
