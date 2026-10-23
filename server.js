@@ -524,7 +524,13 @@ app.use((req, res, next) => {
 // customer approves the ₹49/month autopay mandate, and the first ₹49 charge
 // only happens after day 30. The approval — not a price break — is what
 // both user and Razorpay see up front.
-const FIRST_MONTH_FREE_DAYS = 30;
+// Month 1 costs a token ₹1, collected as Razorpay's `addons` upfront charge
+// during the authorisation transaction; the ₹49 autopay then begins 30 days
+// later via a future `start_at`. Charging ₹1 as the *first cycle* instead is
+// not an option: Razorpay refuses to update a plan on a subscription
+// authorised by UPI or e-mandate, and most Indian users pay by UPI.
+const FIRST_MONTH_DAYS = 30;
+const FIRST_MONTH_PRICE = 100; // ₹1 in paise
 
 // A referral grants a 30-DAY Pro WINDOW (`pro_until`), not a permanent
 // `subscribed` flag — an expired referral therefore drops the user back to
@@ -1566,14 +1572,29 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
     }
 
     const subscription = await razorpay.subscriptions.create({
-      // FIRST MONTH FREE (₹0): billing starts 30 days out. This is Razorpay's
-      // documented way to defer the first charge — during those 30 days the
-      // customer only AUTHORIZES the ₹49/month autopay mandate at checkout
-      // (plus a tiny auto-refunded token payment); the first ₹49 charge
-      // happens at/start of the future cycle, reported by
+      // FIRST MONTH ₹1: billing for the ₹49 plan starts 30 days out, and the
+      // ₹1 is collected NOW as an upfront addon during the authorisation
+      // transaction. That is the difference between this and the old free
+      // month: the customer makes a real (small) payment today, which also
+      // authenticates the mandate without a bare ₹5 token debit. The first
+      // ₹49 charge happens at the start of the future cycle, reported by
       // subscription.activated / subscription.charged via the webhook below.
-      start_at: Math.floor((Date.now() + FIRST_MONTH_FREE_DAYS * 24 * 60 * 60 * 1000) / 1000),
+      start_at: Math.floor((Date.now() + FIRST_MONTH_DAYS * 24 * 60 * 60 * 1000) / 1000),
       plan_id: planId,
+      // Razorpay's only cross-method way to take money at authorisation:
+      // `addons` is "the upfront amount you want to collect as part of the
+      // authorisation transaction". Kept separate from the plan so the
+      // recurring amount stays ₹49.
+      addons: [
+        {
+          item: {
+            name: 'First month',
+            amount: FIRST_MONTH_PRICE,
+            currency: 'INR',
+            description: 'First month at ₹1, then ₹49/month',
+          },
+        },
+      ],
       // Razorpay stops charging after total_count cycles, so 12 silently
       // ended Pro (and the billing) one year after signup. 100 is Razorpay's
       // own maximum — effectively open-ended — and the webhook still reacts to
@@ -1618,11 +1639,11 @@ app.post('/payment/create-subscription', requireAuth, async (req, res) => {
 
     res.json({
       subscription_id: subscription.id,
-      amount: 4900, // what auto-charges once the free first month is over
+      amount: 4900, // what auto-charges once the ₹1 first month is over
       currency: 'INR',
-      // Month 1 costs nothing, but the ₹49 autopay mandate is approved now.
-      first_month_free: true,
-      first_month_free_days: FIRST_MONTH_FREE_DAYS,
+      // Month 1 costs ₹1 (charged with the mandate), month 2 onwards ₹49.
+      first_month_price: FIRST_MONTH_PRICE,
+      first_month_days: FIRST_MONTH_DAYS,
       first_charge_at:
         subscription.start_at
           ? new Date(subscription.start_at * 1000).toISOString()

@@ -354,6 +354,30 @@ test('create-subscription: the TOKEN identity is used — a client-sent phone/em
   );
 });
 
+test('create-subscription: first month is a ₹1 addon, ₹49 autopay starts 30 days out', async () => {
+  const before = Math.floor(Date.now() / 1000);
+  const res = makeRes();
+  await createSubscription(makeReq({ phone: '+919876543210' }), res);
+
+  assert.equal(res.statusCode, 200);
+  const created = razorpayState.lastCreate;
+  assert.equal(created.plan_id, 'plan_test_1', 'the recurring plan is the ₹49 one');
+
+  // ₹1 is collected as an upfront addon during authorisation — NOT by making
+  // the plan ₹1. A ₹1 first cycle cannot be upgraded to ₹49 later on UPI,
+  // which is how most users pay.
+  assert.equal(created.addons.length, 1);
+  assert.equal(created.addons[0].item.amount, 100, 'first month costs ₹1, not ₹0');
+  assert.equal(created.addons[0].item.currency, 'INR');
+
+  const days = (created.start_at - before) / 86400;
+  assert.ok(days > 29.9 && days < 30.1, `₹49 autopay starts 30 days out (got ${days})`);
+
+  assert.equal(res.body.amount, 4900, 'the recurring amount stays ₹49');
+  assert.equal(res.body.first_month_price, 100);
+  assert.equal(res.body.first_month_days, 30);
+});
+
 test('create-subscription: a phone identity prefills the customer contact', async () => {
   uidMap['+919876543210'] = 'uid_phone';
   const res = makeRes();
