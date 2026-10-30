@@ -10,11 +10,12 @@ const assert = require('node:assert/strict');
 const Module = require('node:module');
 
 // ── express / multer / pg / sharp / dotenv fakes ────────────────────────
-const routes = { get: {}, post: {} };
+const routes = { get: {}, post: {}, delete: {} };
 const appStub = {
   use: () => {},
   get: (p, ...fns) => { routes.get[p] = fns[fns.length - 1]; },
   post: (p, ...fns) => { routes.post[p] = fns[fns.length - 1]; },
+  delete: (p, ...fns) => { routes['delete'][p] = fns[fns.length - 1]; },
   listen: () => {},
 };
 function express() { return appStub; }

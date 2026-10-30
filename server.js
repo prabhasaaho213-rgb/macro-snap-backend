@@ -158,6 +158,9 @@ const RATE_WINDOWS = {
   '/chat': 30,
   '/analyze': 20,
   '/generate-diet-plan': 6,
+  // Photo uploads each cost a Firestore write; few per user per day, but the
+  // cap still stops a runaway client from hammering the collection.
+  '/meals/photos': 20,
 };
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_COLLECTION = 'rateLimits';
@@ -523,13 +526,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Pricing: first month free ──────────────────────────────────────────
+// ── Pricing: ₹1 first month, then ₹49/month ────────────────────────────
 // The old 30-day free trial is GONE — for new and existing users alike (the
 // owner/admin account keeps its permanent claim-based Pro). Pro now starts
-// with a Razorpay subscription whose FIRST MONTH IS ₹0: at checkout the
-// customer approves the ₹49/month autopay mandate, and the first ₹49 charge
-// only happens after day 30. The approval — not a price break — is what
-// both user and Razorpay see up front.
+// with a Razorpay subscription whose FIRST MONTH IS ₹1, collected up front
+// (see the addons note below): at checkout the customer pays that ₹1 and
+// approves the ₹49/month autopay mandate, and the first ₹49 charge only
+// happens after day 30.
 // Month 1 costs a token ₹1, collected as Razorpay's `addons` upfront charge
 // during the authorisation transaction; the ₹49 autopay then begins 30 days
 // later via a future `start_at`. Charging ₹1 as the *first cycle* instead is
@@ -1550,6 +1553,153 @@ app.post('/meals/sync', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Meal Photos (Pro) ─────────────────────────────────────────────────────
+// Cloud backup of a meal's photo so it shows on a new device and outlives the
+// configurable local retention window (Settings → Meal Photos). Stored in
+// Firestore documents mealPhotos/{mealId}: Cloud Storage is not provisioned
+// for this project and a meal card only ever draws a thumbnail, so a doc blob
+// is the smallest implementation that answers the real need — the client
+// uploads, downloads and deletes through these routes and never touches the
+// collection directly (firestore.rules denies it).
+//
+// Why the backend and not the client writing Firestore itself: the Pro gate
+// must live server-side. If clients could write mealPhotos directly, a free
+// account could push photos for every meal straight into Firestore and the
+// paywall would be cosmetic. These routes check entitlementsFor() exactly like
+// /chat and /generate-diet-plan do.
+//
+// Uploads are compressed here with sharp before storage: 720 px on the long
+// edge at q72 keeps a meal photo around 60–150 KB — small enough that the
+// base64 field stays well under Firestore's 1 MiB document limit — and the
+// client's original is never trusted as "already small".
+
+// Firestore caps a DOCUMENT at 1 MiB. The encoded base64 grows 4/3 over the
+// JPEG bytes, so the JPEG is capped such that even a worst case fits, and a
+// second pass at q50 catches the rare noisy shot that misses it.
+const PHOTO_MAX_JPEG_BYTES = 600 * 1024;
+
+// Sanitizes the meal id: it becomes a Firestore document id and part of the
+// URL. The client generates UUID-ish ids; anything longer or stranger is a
+// malformed request, not a photo.
+function saneMealId(id) {
+  return typeof id === 'string' && id.length >= 1 && id.length <= 128 ? id : null;
+}
+
+// Compresses an uploaded photo to the stored form. .rotate() honours the
+// camera's EXIF orientation so the stored thumbnail is never sideways; the
+// resize bounds the long edge at 720 px without enlarging smaller shots.
+async function compressMealPhoto(buffer) {
+  const first = await sharp(buffer)
+    .rotate()
+    .resize(720, 720, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 72 })
+    .toBuffer();
+  if (first.length <= PHOTO_MAX_JPEG_BYTES) return first;
+  return sharp(buffer)
+    .rotate()
+    .resize(720, 720, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 50 })
+    .toBuffer();
+}
+
+// Upload / replace the photo for one of the caller's meals. Pro only.
+app.post('/meals/:mealId/photo', requireAuth, rateLimit('/meals/photos'), upload.single('image'), async (req, res) => {
+    try {
+      const id = identityOf(req);
+      if (!id.uid) return res.status(401).json({ error: 'unauthenticated' });
+
+      // Pro gate, server-side: the toggle in Settings is only the offer.
+      const ent = await entitlementsFor(id);
+      if (!ent.subscribed) {
+        return res.status(403).json({
+          error: 'pro_required',
+          message: 'Meal photo backup is a Pro feature. Upgrade to keep your photos in the cloud.',
+        });
+      }
+
+      const mealId = saneMealId(req.params.mealId);
+      if (!mealId) return res.status(400).json({ error: 'Invalid meal id' });
+      if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+      if (!String(req.file.mimetype || '').startsWith('image/')) {
+        return res.status(400).json({ error: 'File must be an image' });
+      }
+      if (firestore.isEnabled() !== true) {
+        return res.status(503).json({ error: 'Photo backup is temporarily unavailable' });
+      }
+
+      let jpeg;
+      try {
+        jpeg = await compressMealPhoto(req.file.buffer);
+      } catch (e) {
+        return res.status(400).json({ error: 'File must be a valid image' });
+      }
+      if (jpeg.length > PHOTO_MAX_JPEG_BYTES) {
+        return res.status(413).json({
+          error: 'photo_too_large',
+          message: 'This photo is too large to back up. Try a smaller picture.',
+        });
+      }
+
+      const saved = await firestore.set('mealPhotos/' + mealId, {
+        uid: id.uid,
+        data: jpeg.toString('base64'),
+        contentType: 'image/jpeg',
+        bytes: jpeg.length,
+        updatedAt: new Date(),
+      });
+      if (!saved) {
+        return res.status(503).json({ error: 'Photo backup is temporarily unavailable' });
+      }
+      res.json({ ok: true, mealId, bytes: jpeg.length });
+    } catch (e) {
+      return sendFailure(req, res, e);
+    }
+});
+
+// Download one of the caller's meal photos (base64 JPEG in the JSON body).
+app.get('/meals/:mealId/photo', requireAuth, async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const mealId = saneMealId(req.params.mealId);
+    if (!mealId) return res.status(400).json({ error: 'Invalid meal id' });
+    const doc = await firestore.get('mealPhotos/' + mealId);
+    if (!doc) return res.status(404).json({ error: 'photo_not_found' });
+    if (doc.uid !== id.uid) {
+      return res.status(403).json({ error: 'not_your_photo' });
+    }
+    res.json({
+      found: true,
+      contentType: typeof doc.contentType === 'string' ? doc.contentType : 'image/jpeg',
+      data: typeof doc.data === 'string' ? doc.data : null,
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+// Delete one of the caller's meal photos — it follows the meal itself, just
+// like the local copy does. Owner-checked so one account cannot wipe
+// another's backup.
+app.delete('/meals/:mealId/photo', requireAuth, async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const mealId = saneMealId(req.params.mealId);
+    if (!mealId) return res.status(400).json({ error: 'Invalid meal id' });
+    const doc = await firestore.get('mealPhotos/' + mealId);
+    if (!doc) return res.status(404).json({ error: 'photo_not_found' });
+    if (doc.uid !== id.uid) {
+      return res.status(403).json({ error: 'not_your_photo' });
+    }
+    const ok = await firestore.del('mealPhotos/' + mealId);
+    if (!ok) {
+      return res.status(503).json({ error: 'Photo backup is temporarily unavailable' });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
 // ─── Habits & Water Log ─────────────────────────────────────────────────────
 // REMOVED: POST /habits/sync and GET /habits/list/:phone (audit).
 // The comment that used to sit here said the Flutter app's MealSyncService
@@ -1559,7 +1709,8 @@ app.post('/meals/sync', requireAuth, async (req, res) => {
 // '/habits/list' call anywhere. They were dead, so they are removed.
 
 // ─── Razorpay: Create Recurring Subscription ───────────────────────────────
-// Real ₹49/month recurring billing (first month ₹0): creates a Razorpay
+// Real ₹49/month recurring billing (first month ₹1, charged up front):
+// creates a Razorpay
 // Subscription (auto-
 // charges every month) instead of a one-time order. The app opens checkout
 // with the returned subscription_id; Razorpay then charges the customer

@@ -61,7 +61,7 @@ const firestoreStub = {
 };
 
 // ── express / multer / pg / sharp / dotenv fakes ────────────────────────
-const routes = { get: {}, post: {}, chains: { get: {}, post: {} } };
+const routes = { get: {}, post: {}, delete: {}, chains: { get: {}, post: {}, delete: {} } };
 const appStub = {
   use: () => {},
   get: (p, ...fns) => {
@@ -71,6 +71,10 @@ const appStub = {
   post: (p, ...fns) => {
     routes.post[p] = fns[fns.length - 1];
     routes.chains.post[p] = fns;
+  },
+  delete: (p, ...fns) => {
+    routes['delete'][p] = fns[fns.length - 1];
+    routes.chains['delete'][p] = fns;
   },
   listen: () => {},
 };

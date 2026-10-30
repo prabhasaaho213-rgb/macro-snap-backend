@@ -37,6 +37,12 @@ const firestoreStub = {
     if (fsDocs[col]) delete fsDocs[col][id];
     return true;
   },
+  get: async (path) => {
+    const [col, ...rest] = path.split('/');
+    const id = rest.join('/');
+    const d = (fsDocs[col] || {})[id];
+    return d || null;
+  },
   getDb: () => ({
     collection: (name) => ({
       doc: (id) => ({
@@ -94,7 +100,7 @@ const adminStub = {
 
 // ── express / multer / pg / sharp / dotenv fakes ────────────────────────
 // The chain is captured in full so the middleware is actually executed.
-const routes = { get: {}, post: {}, chains: { get: {}, post: {} } };
+const routes = { get: {}, post: {}, delete: {}, chains: { get: {}, post: {}, delete: {} } };
 const appStub = {
   use: () => {},
   get: (p, ...fns) => {
@@ -104,6 +110,10 @@ const appStub = {
   post: (p, ...fns) => {
     routes.post[p] = fns[fns.length - 1];
     routes.chains.post[p] = fns;
+  },
+  delete: (p, ...fns) => {
+    routes['delete'][p] = fns[fns.length - 1];
+    routes.chains['delete'][p] = fns;
   },
   listen: () => {},
 };
@@ -120,7 +130,16 @@ function multer() {
 }
 multer.memoryStorage = () => ({});
 const pgStub = { Pool: class { query() { return { rows: [] }; } } };
-const sharpStub = (buf) => ({ jpeg: () => ({ toBuffer: async () => buf }) });
+const sharpStub = (buf) => {
+  // Chainable: /analyze's prepareImage uses .jpeg().toBuffer(), the meal-photo
+  // uploader uses .rotate().resize(..).jpeg(..).toBuffer(). Both must resolve.
+  const chain = {
+    rotate() { return chain; },
+    resize() { return chain; },
+    jpeg: () => ({ toBuffer: async () => buf }),
+  };
+  return chain;
+};
 
 const origLoad = Module._load;
 Module._load = function (request) {
@@ -239,6 +258,9 @@ const PROTECTED = [
   ['post', '/account/delete'],
   ['post', '/chat'],
   ['get', '/subscription/status'],
+  ['post', '/meals/:mealId/photo'],
+  ['get', '/meals/:mealId/photo'],
+  ['delete', '/meals/:mealId/photo'],
 ];
 
 // Routes the audit removed. Kept as a list so a "helpful" re-addition of any
@@ -662,6 +684,61 @@ test('subscription/status: a live referral window is Pro, an expired one is not'
   await callRoute('get', '/subscription/status', makeReq({}, 'token-a'), expired);
   assert.equal(expired.body.subscribed, false,
     'an expired referral must drop the user back to free');
+});
+
+// ── Meal photo backup (Pro, Firestore blob) ────────────────────────────
+test('meal photos: a free account cannot upload; Pro can, and the doc carries its uid', async () => {
+  const free = makeRes();
+  await callRoute('post', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm1' } }, 'token-a'), free);
+  assert.equal(free.statusCode, 403);
+  assert.equal(free.body.error, 'pro_required');
+  assert.ok(!fsDocs.mealPhotos || !fsDocs.mealPhotos.m1, 'no photo may be written for a free user');
+
+  fsDocs.users = { uidA: { subscribed: true } };
+  const pro = makeRes();
+  await callRoute('post', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm1' } }, 'token-a'), pro);
+  assert.equal(pro.statusCode, 200);
+  assert.ok(pro.body.ok);
+  assert.equal(fsDocs.mealPhotos.m1.uid, 'uidA');
+  assert.equal(fsDocs.mealPhotos.m1.contentType, 'image/jpeg');
+  assert.ok(fsDocs.mealPhotos.m1.data.length > 0, 'the doc carries the image payload');
+});
+
+test('meal photos: reads and deletes are owner-only by the STORAGE uid, not the client claim', async () => {
+  fsDocs.users = { uidA: { subscribed: true } };
+  fsDocs.mealPhotos = { m1: { uid: 'uidA', data: 'ZmFrZQ==', contentType: 'image/jpeg' } };
+
+  const foreign = makeRes();
+  await callRoute('get', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm1' } }, 'token-b'), foreign);
+  assert.equal(foreign.statusCode, 403);
+  assert.equal(foreign.body.error, 'not_your_photo');
+
+  const mine = makeRes();
+  await callRoute('get', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm1' } }, 'token-a'), mine);
+  assert.equal(mine.statusCode, 200);
+  assert.equal(mine.body.data, 'ZmFrZQ==');
+
+  // A foreign uid on the doc is not trusted either: b cannot read a photo
+  // whose doc claims uidB unless b is the caller — the caller always is, so
+  // the real check is that uidB's OWN photo reads fine and uidA's does not.
+  const foreignOther = makeRes();
+  await callRoute('get', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm2' } }, 'token-a'), foreignOther);
+  assert.equal(foreignOther.statusCode, 404);
+
+  const foreignDel = makeRes();
+  await callRoute('delete', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm1' } }, 'token-b'), foreignDel);
+  assert.equal(foreignDel.statusCode, 403);
+  assert.equal(fsDocs.mealPhotos.m1.uid, 'uidA', 'a foreign token must not delete the backup');
+
+  fsDocs.mealPhotos.m2 = { uid: 'uidB', data: 'eA==' };
+  const selfDel = makeRes();
+  await callRoute('delete', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm2' } }, 'token-b'), selfDel);
+  assert.equal(selfDel.statusCode, 200);
+  assert.equal((fsDocs.mealPhotos.m2 || {}).data, undefined, 'delete removes the doc');
+
+  const again = makeRes();
+  await callRoute('delete', '/meals/:mealId/photo', makeReq({ params: { mealId: 'm2' } }, 'token-b'), again);
+  assert.equal(again.statusCode, 404);
 });
 
 test('restored after tests', () => { global.fetch = origFetch; });
