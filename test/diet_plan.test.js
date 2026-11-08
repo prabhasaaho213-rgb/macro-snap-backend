@@ -206,4 +206,33 @@ test('a subscribed user is not Pro-gated (the gate is not a blanket refusal)', a
   assert.equal(gemini.prompts.length, 1);
 });
 
+test('numbers outside a plausible range are refused before any Gemini call', async () => {
+  // "abc", a 5 cm height and a negative weight all used to reach the BMR
+  // arithmetic and come back as BMI NaN — one paid call per attempt.
+  for (const body of [
+    { weight: 'abc', height: 170, age: 25 },
+    { weight: 70, height: 5, age: 25 },
+    { weight: -70, height: 170, age: 25 },
+    { weight: 70, height: 170, age: 250 },
+  ]) {
+    const res = makeRes();
+    await handler(makeReq({ ...body, gender: 'male', goal: 'maintain', activity: 'moderate' }), res);
+    assert.equal(res.statusCode, 400, JSON.stringify(body));
+    assert.equal(res.payload.error, 'invalid_body');
+  }
+  assert.equal(gemini.prompts.length, 0, 'invalid input must not cost a Gemini call');
+});
+
+test('a deficit is never generated for an underweight user', async () => {
+  // 40 kg at 180 cm is BMI 12.3. The app asks with a dialog; the server has to
+  // hold the same 18.5 floor because the client is not the authority.
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(makeReq({ weight: 40, height: 180, age: 25, gender: 'male', goal: 'loseWeight', activity: 'moderate', diet: 'vegetarian' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.match(gemini.prompts[0], /Goal: maintain/);
+  assert.doesNotMatch(gemini.prompts[0], /Goal: loseWeight/);
+  assert.equal(res.payload.targetCalories, res.payload.tdee, 'maintain means no deficit');
+});
+
 test('restored after tests', () => { global.fetch = origFetch; });

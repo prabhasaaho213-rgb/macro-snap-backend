@@ -1100,8 +1100,24 @@ const planText = (plan) => [
 
 app.post('/generate-diet-plan', requireAuth, rateLimit('/generate-diet-plan'), async (req, res) => {
   try {
-    const { weight, height, age, gender, goal, activity, diet } = req.body;
-    if (!weight || !height || !age) return res.status(400).json({ error: 'Weight, height & age required' });
+    const { weight, height, age, gender, goal, activity, diet } = req.body || {};
+    // Presence was the only check here, so a Pro client could post "abc" or a
+    // 5 cm height and get a plan for BMI NaN — a paid Gemini call wasted on a
+    // nonsensical answer. Bound the numbers before any arithmetic runs.
+    const num = (v) => (typeof v === 'number' ? v : Number(v));
+    const w = num(weight);
+    const h = num(height);
+    const a = num(age);
+    const validBody =
+      Number.isFinite(w) && w >= 20 && w <= 300 &&
+      Number.isFinite(h) && h >= 80 && h <= 250 &&
+      Number.isFinite(a) && a >= 13 && a <= 120;
+    if (!validBody) {
+      return res.status(400).json({
+        error: 'invalid_body',
+        message: 'Weight, height and age must be within a realistic range.',
+      });
+    }
 
     // The AI meal plan is a PRO feature, gated exactly like /chat: a plan is a
     // Gemini call we pay for, so a signed-in free user must not be able to
@@ -1119,14 +1135,27 @@ app.post('/generate-diet-plan', requireAuth, rateLimit('/generate-diet-plan'), a
       });
     }
 
-    const bmr = gender === 'male' ? 10 * weight + 6.25 * height - 5 * age + 5 : 10 * weight + 6.25 * height - 5 * age - 161;
+    const sex = gender === 'female' ? 'female' : 'male';
+    const bmr = sex === 'male'
+      ? 10 * w + 6.25 * h - 5 * a + 5
+      : 10 * w + 6.25 * h - 5 * a - 161;
     const multipliers = { sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, veryActive: 1.9 };
-    const tdee = bmr * (multipliers[activity] || 1.2);
-    const bmi = weight / ((height / 100) * (height / 100));
-    const calTarget = goal === 'loseWeight' ? tdee - 500 : goal === 'gainMuscle' ? tdee + 300 : tdee;
-    const proteinTarget = goal === 'gainMuscle' ? weight * 2.2 : goal === 'loseWeight' ? weight * 2.0 : weight * 1.6;
+    const activityKey = Object.prototype.hasOwnProperty.call(multipliers, activity) ? activity : 'sedentary';
+    const tdee = bmr * multipliers[activityKey];
+    const bmi = w / ((h / 100) * (h / 100));
+
+    // The same 18.5 floor the app enforces with a dialog. The client is not the
+    // authority: a crafted request could otherwise buy a deficit plan for an
+    // underweight user.
+    const goalKey = goal === 'gainMuscle' || goal === 'loseWeight' ? goal : 'maintain';
+    const safeGoal = goalKey === 'loseWeight' && bmi < 18.5 ? 'maintain' : goalKey;
+
+    const calTarget = safeGoal === 'loseWeight' ? tdee - 500 : safeGoal === 'gainMuscle' ? tdee + 300 : tdee;
+    const proteinTarget = safeGoal === 'gainMuscle' ? w * 2.2 : safeGoal === 'loseWeight' ? w * 2.0 : w * 1.6;
     const fatTarget = calTarget * 0.25 / 9;
-    const carbTarget = (calTarget - (proteinTarget * 4) - (fatTarget * 9)) / 4;
+    // Protein + fat can overshoot a low calorie target; a negative carb figure
+    // would go straight into the prompt and the app's numbers row.
+    const carbTarget = Math.max(0, (calTarget - (proteinTarget * 4) - (fatTarget * 9)) / 4);
 
     // Diet preference: the app sends DietPreference.name — 'vegetarian' or
     // 'nonVegetarian'. Absent/unknown values fall back to vegetarian: offering
@@ -1145,8 +1174,8 @@ app.post('/generate-diet-plan', requireAuth, rateLimit('/generate-diet-plan'), a
       'Never leave a regional or Hindi word unexplained, and put the explanation right after the term — not at the end of the sentence.';
 
     const prompt = `You are an Indian nutritionist. Generate a personalized ONE-DAY Indian diet plan.
-User: ${gender}, ${age} yrs, ${weight}kg, ${height}cm, BMI ${bmi.toFixed(1)}.
-Goal: ${goal}, Activity: ${activity}.
+User: ${sex}, ${a} yrs, ${w}kg, ${h}cm, BMI ${bmi.toFixed(1)}.
+Goal: ${safeGoal}, Activity: ${activityKey}.
 ${dietLine}
 ${languageLine}
 TDEE: ${Math.round(tdee)} kcal, Target: ${Math.round(calTarget)} kcal/day.
