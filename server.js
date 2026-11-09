@@ -599,6 +599,26 @@ function proUntilActive(iso) {
   return Number.isFinite(t) && t > Date.now();
 }
 
+// End of the billing period the customer has ALREADY paid for, as an ISO
+// string — null when Razorpay reported no cycle, or the cycle is already over.
+//
+// `current_end` is the end of the running cycle; `start_at` is the day the
+// ₹49 autopay begins, which for a new account is exactly the end of the ₹1
+// first month it just paid for. Cancelling a mandate used to switch Pro off on
+// the spot and take those paid days with it, so both dates count here.
+function paidCycleEnd(sub) {
+  if (!sub) return null;
+  const future = [sub.current_end, sub.start_at]
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v) && v > 0)
+    // Razorpay sends unix seconds; a millisecond value (a fixture, or a newer
+    // API) would otherwise read as the year 55000.
+    .map((v) => (v > 1e12 ? v : v * 1000))
+    .filter((ms) => ms > Date.now());
+  if (!future.length) return null;
+  return new Date(Math.max(...future)).toISOString();
+}
+
 // ─── Free-scan entitlements — the SERVER is the authority ─────────────────
 //
 // Reads this user's subscription/trial state and their daily scan counter in
@@ -2106,7 +2126,21 @@ app.post('/payment/webhook', async (req, res) => {
       }
       outcome = 'activated';
     } else if (turnOff) {
-      await dbq('UPDATE users SET subscribed = false WHERE phone = $1', [phone]);
+      // ── Cancelling stops the NEXT charge, not days already paid for ──
+      // This used to switch Pro off the moment the mandate died. Subscribe
+      // with the ₹1 first month, cancel the autopay a week later, and the app
+      // answered "not Pro — subscribe again" for a month the customer had
+      // already paid for. The paid cycle now runs to its end: `subscribed`
+      // goes false (nothing will ever auto-charge again) while `pro_until`
+      // carries the window — the same field the referral reward uses, so
+      // entitlementsFor() and /subscription/status already honour it.
+      const paidUntil = paidCycleEnd(sub);
+      await dbq(
+        paidUntil
+          ? 'UPDATE users SET subscribed = false, pro_until = $1 WHERE phone = $2'
+          : 'UPDATE users SET subscribed = false WHERE phone = $1',
+        paidUntil ? [paidUntil, phone] : [phone]
+      );
       try {
         await dbq('UPDATE subscriptions SET status = $1, updated_at = NOW() WHERE id = $2', [sub?.status || 'cancelled', subscriptionId]);
       } catch (_) {}
@@ -2114,7 +2148,13 @@ app.post('/payment/webhook', async (req, res) => {
       {
         const fUid = await firestore.resolveUid(phone);
         if (fUid) {
-          await firestore.set('users/' + fUid, { subscribed: false }, { merge: true });
+          await firestore.set(
+            'users/' + fUid,
+            paidUntil
+              ? { subscribed: false, pro_until: paidUntil, pro_until_at: new Date(paidUntil) }
+              : { subscribed: false },
+            { merge: true }
+          );
         }
         if (subscriptionId) {
           await firestore.set('subscriptions/' + subscriptionId, { status: sub?.status || 'cancelled', updatedAt: new Date() }, { merge: true });
@@ -2158,6 +2198,7 @@ async function paymentStatusHandler(req, res) {
     // Whether the ₹1 intro month is still available to this account — the
     // paywall shows ₹1 copy only when the server says so, so a re-subscriber
     // is never promised a price their checkout will not charge.
+    let proUntil = null;
     let introUsed = false;
     try {
       const fUid = await firestore.resolveUid(phone);
@@ -2166,6 +2207,13 @@ async function paymentStatusHandler(req, res) {
         if (doc.exists) {
           subscribed = doc.data().subscribed === true;
           introUsed = doc.data().intro_used === true;
+          // A cancelled subscription can still have days of the cycle it has
+          // already paid for. Reporting false here made the app's payment poll
+          // say "free" while /subscription/status said "Pro".
+          if (!subscribed && proUntilActive(doc.data().pro_until)) {
+            subscribed = true;
+            proUntil = doc.data().pro_until;
+          }
         }
         const snap = await firestore
           .getDb()
@@ -2191,17 +2239,26 @@ async function paymentStatusHandler(req, res) {
       }
     } catch (_) {}
     if (!subscribed && !payment) {
-      const user = await dbq('SELECT subscribed, intro_used FROM users WHERE phone = $1', [phone]);
+      const user = await dbq('SELECT subscribed, intro_used, pro_until FROM users WHERE phone = $1', [phone]);
       const payments = await dbq(
         'SELECT * FROM payments WHERE phone = $1 ORDER BY created_at DESC LIMIT 1',
         [phone]
       );
       subscribed = user.rows[0]?.subscribed || false;
       introUsed = introUsed || user.rows[0]?.intro_used === true;
+      if (!subscribed && proUntilActive(user.rows[0]?.pro_until)) {
+        subscribed = true;
+        proUntil = user.rows[0].pro_until;
+      }
       payment = payments.rows[0] || null;
       if (payment) introUsed = true;
     }
-    res.json({ subscribed, payment, intro_eligible: !introUsed });
+    res.json({
+      subscribed,
+      payment,
+      intro_eligible: !introUsed,
+      ...(proUntil ? { pro_until: proUntil } : {}),
+    });
   } catch (e) {
     return sendFailure(req, res, e);
   }

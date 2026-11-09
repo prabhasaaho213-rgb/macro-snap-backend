@@ -312,6 +312,70 @@ test('webhook: subscription.cancelled deactivates the user', async () => {
   assert.equal(lastFsSet((s) => s.path === 'webhookLog/evt_cancel').data.outcome, 'deactivated');
 });
 
+test('webhook: cancelling mid-cycle keeps Pro to the end of the paid cycle', async () => {
+  uidMap['grace@example.com'] = 'uid_grace';
+  fsDocs.users = { uid_grace: { subscribed: true } };
+  const end = Math.floor(Date.now() / 1000) + 20 * 24 * 60 * 60;
+  const body = {
+    entity: 'event', id: 'evt_cancel_paid', event: 'subscription.cancelled',
+    payload: {
+      subscription: {
+        entity: {
+          id: 'sub_paid', status: 'cancelled', notes: { phone: 'grace@example.com' },
+          current_start: Math.floor(Date.now() / 1000) - 10 * 24 * 60 * 60,
+          current_end: end,
+        },
+      },
+    },
+  };
+  const res = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), res);
+  assert.equal(res.statusCode, 200);
+  const user = lastFsSet((s) => s.path === 'users/uid_grace');
+  assert.equal(user.data.subscribed, false, 'the autopay itself is over');
+  assert.ok(
+    Math.abs(Date.parse(user.data.pro_until) - end * 1000) < 2000,
+    'Pro runs to the end of the month already paid for'
+  );
+  assert.ok(user.data.pro_until_at instanceof Date);
+});
+
+test('webhook: a cancelled ₹1 intro month runs to the day the ₹49 cycle starts', async () => {
+  uidMap['intro@example.com'] = 'uid_intro';
+  fsDocs.users = { uid_intro: { subscribed: true, intro_used: true } };
+  const startsAt = Math.floor(Date.now() / 1000) + 25 * 24 * 60 * 60;
+  const body = {
+    entity: 'event', id: 'evt_cancel_intro', event: 'subscription.cancelled',
+    payload: {
+      subscription: {
+        entity: {
+          id: 'sub_intro', status: 'cancelled', start_at: startsAt,
+          notes: { phone: 'intro@example.com' },
+        },
+      },
+    },
+  };
+  const res = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), res);
+  const user = lastFsSet((s) => s.path === 'users/uid_intro');
+  assert.equal(user.data.subscribed, false);
+  assert.ok(
+    Math.abs(Date.parse(user.data.pro_until) - startsAt * 1000) < 2000,
+    'the ₹1 month that was paid for is not thrown away'
+  );
+});
+
+test('payment/status: a cancelled subscription still reports Pro while its paid cycle runs', async () => {
+  uidMap['grace2@example.com'] = 'uid_grace2';
+  const until = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString();
+  fsDocs.users = { uid_grace2: { subscribed: false, intro_used: true, pro_until: until } };
+  const res = makeRes();
+  await paymentStatus(makeReq({}, { as: 'grace2@example.com' }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.subscribed, true);
+  assert.equal(res.body.pro_until, until);
+});
+
 test('webhook: non-state events are logged as ignored', async () => {
   const body = {
     entity: 'event', id: 'evt_created', event: 'subscription.created',
