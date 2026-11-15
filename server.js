@@ -2176,8 +2176,14 @@ app.post('/payment/webhook', async (req, res) => {
       eventType === 'subscription.completed' ||
       eventType.includes('cancelled') ||
       eventType.includes('paused') ||
-      eventType.includes('halted') ||
-      eventType.includes('failed');
+      eventType.includes('halted');
+    // A single failed charge is NOT the end of a subscription. Razorpay retries
+    // every failed attempt and only emits subscription.halted once those
+    // retries are exhausted (or the mandate is revoked). Treating the first
+    // payment.failed as an off-switch cut off customers whose card was charged
+    // successfully on the last retry minutes later — they paid, and the app had
+    // already told them they were not Pro.
+    const paymentFailed = eventType.includes('failed');
 
     // Ordering: never rewind a subscription to an older event than the last
     // one applied. The marker is written with each state change below.
@@ -2228,6 +2234,10 @@ app.post('/payment/webhook', async (req, res) => {
         }
       }
       outcome = 'activated';
+    } else if (paymentFailed) {
+      // Keep whatever state the account already has: a paying customer stays
+      // Pro through the retry window, and someone who never paid stays free.
+      outcome = 'payment_failed_grace';
     } else if (turnOff) {
       // ── Cancelling stops the NEXT charge, not days already paid for ──
       // This used to switch Pro off the moment the mandate died. Subscribe

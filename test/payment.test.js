@@ -913,6 +913,64 @@ test('webhook: a body that was not captured raw is rejected, never re-serialized
   assert.ok(!fsSets.some((s) => s.path.startsWith('users/')));
 });
 
+// ── Webhook: a failed charge inside the retry window ────────────────────
+// Razorpay retries a failed charge and only emits subscription.halted once
+// those retries are exhausted. The first payment.failed used to switch Pro off
+// immediately, so a customer whose card went through on the last retry had
+// already been told they were not Pro.
+test('webhook: a failed charge keeps Pro on during the retry window', async () => {
+  uidMap['123spandana88@gmail.com'] = 'uid1';
+  const body = {
+    entity: 'event',
+    id: 'evt_failed_1',
+    event: 'payment.failed',
+    created_at: 1700000100,
+    payload: {
+      payment: {
+        entity: {
+          id: 'pay_failed_1',
+          status: 'failed',
+          subscription_id: 'sub_grace',
+          notes: { phone: '123spandana88@gmail.com' },
+        },
+      },
+      subscription: { entity: { id: 'sub_grace', status: 'active', notes: { phone: '123spandana88@gmail.com' } } },
+    },
+  };
+  const res = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.ok(
+    !fsSets.some((s) => s.path === 'users/uid1' && s.data.subscribed === false),
+    'a failed charge must not deactivate a subscriber mid-retry'
+  );
+  assert.equal(
+    lastFsSet((s) => s.path === 'webhookLog/evt_failed_1').data.outcome,
+    'payment_failed_grace'
+  );
+});
+
+test('webhook: subscription.halted is what finally turns Pro off', async () => {
+  uidMap['123spandana88@gmail.com'] = 'uid1';
+  const body = {
+    entity: 'event',
+    id: 'evt_halted_1',
+    event: 'subscription.halted',
+    created_at: 1700009900,
+    payload: {
+      subscription: { entity: { id: 'sub_grace', status: 'halted', notes: { phone: '123spandana88@gmail.com' } } },
+    },
+  };
+  const res = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), res);
+
+  assert.equal(res.statusCode, 200);
+  const write = lastFsSet((s) => s.path === 'users/uid1');
+  assert.equal(write.data.subscribed, false);
+  assert.equal(lastFsSet((s) => s.path === 'webhookLog/evt_halted_1').data.outcome, 'deactivated');
+});
+
 // /register writes the name into userIndex, which every later restore reads, so
 // an unbounded name would be stored once and replayed onto every device.
 const register = routes.post['/register'];
