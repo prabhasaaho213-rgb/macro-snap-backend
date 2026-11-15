@@ -158,6 +158,15 @@ const RATE_WINDOWS = {
   '/chat': 30,
   '/analyze': 20,
   '/generate-diet-plan': 6,
+  // Referral codes are 6 characters from a 32-symbol alphabet. Nothing stopped
+  // a signed-in script from trying thousands a minute until one hit, and each
+  // hit is a month of Pro for the guesser (and for the referrer). A tight cap
+  // makes enumeration impractical while a real user, who types one code once,
+  // never notices.
+  '/referral/apply': 10,
+  // Each call creates a Razorpay customer and subscription, so an unlimited
+  // loop is a way to fill the merchant account with junk mandates.
+  '/payment/create-subscription': 5,
 };
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_COLLECTION = 'rateLimits';
@@ -1168,10 +1177,27 @@ app.post('/generate-diet-plan', requireAuth, rateLimit('/generate-diet-plan'), a
     // authority: a crafted request could otherwise buy a deficit plan for an
     // underweight user.
     const goalKey = goal === 'gainMuscle' || goal === 'loseWeight' ? goal : 'maintain';
-    const safeGoal = goalKey === 'loseWeight' && bmi < 18.5 ? 'maintain' : goalKey;
+    // Compare the PRINTED BMI (one decimal), exactly like the app: 18.46 shows
+    // as "18.5" and a plan built from the raw value would refuse a goal the
+    // app itself allows.
+    const shownBmi = Math.round(bmi * 10) / 10;
+    const safeGoal = goalKey === 'loseWeight' && shownBmi < 18.5 ? 'maintain' : goalKey;
 
-    const calTarget = safeGoal === 'loseWeight' ? tdee - 500 : safeGoal === 'gainMuscle' ? tdee + 300 : tdee;
-    const proteinTarget = safeGoal === 'gainMuscle' ? w * 2.2 : safeGoal === 'loseWeight' ? w * 2.0 : w * 1.6;
+    // Mirrors lib/models/diet_profile.dart, because the app prints its OWN
+    // targets next to this plan: the plan's meals have to add up to the numbers
+    // on that screen. The old figures (2.0 g/kg on a loss goal, and a plain
+    // TDEE − 500 with no floor) disagreed with it on both counts — the header
+    // said 1.8 g/kg and 1,200 kcal while the meals were built for a lower
+    // protein target and, for a small sedentary user, a sub-1,200 deficit.
+    const SAFE_MIN_KCAL = sex === 'female' ? 1200 : 1500;
+    const proteinPerKg = safeGoal === 'gainMuscle' ? 2.2 : safeGoal === 'loseWeight' ? 1.8 : 1.6;
+    const proteinTarget = Math.min(w * proteinPerKg, 180);
+
+    const rawCalTarget =
+      safeGoal === 'loseWeight' ? tdee - 500 : safeGoal === 'gainMuscle' ? tdee + 300 : tdee;
+    const calTarget = safeGoal === 'loseWeight'
+      ? Math.max(rawCalTarget, Math.round(bmr), SAFE_MIN_KCAL)
+      : rawCalTarget;
     const fatTarget = calTarget * 0.25 / 9;
     // Protein + fat can overshoot a low calorie target; a negative carb figure
     // would go straight into the prompt and the app's numbers row.
@@ -1253,14 +1279,20 @@ app.post('/register', requireAuth, async (req, res) => {
     // The name is user data the client may choose; the IDENTITY is not — it
     // comes from the verified token (auth.js), never from the request body.
     const { name } = req.body;
+    // Bounded: the app caps a nickname at 15 characters, but this is a public
+    // endpoint and the value is mirrored into userIndex for every future
+    // restore, so an unbounded string (up to the 1 MB body limit) would be
+    // stored and replayed onto every device.
+    const safeName =
+      typeof name === 'string' ? name.trim().slice(0, 40) : '';
     const id = identityOf(req);
     const identifier = id.identifier;
     const email = id.email;
     if (!identifier) return res.status(400).json({ error: 'Identity required' });
-    if (email && name) {
+    if (email && safeName) {
       await dbq(
         'INSERT INTO users (phone, email, name) VALUES ($1, $2, $3) ON CONFLICT (phone) DO UPDATE SET email = $2, name = $3',
-        [identifier, email, name]
+        [identifier, email, safeName]
       );
     } else {
       await dbq('INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING', [identifier]);
@@ -1278,9 +1310,9 @@ app.post('/register', requireAuth, async (req, res) => {
         await firestore.set('users/' + fUid, {
           identifier: identifier,
           email: email || null,
-          name: name || '',
+          name: safeName,
         }, { merge: true });
-        await firestore.set('userIndex/' + identifier, { uid: fUid, name: name || '' }, { merge: true });
+        await firestore.set('userIndex/' + identifier, { uid: fUid, name: safeName }, { merge: true });
       }
     }
     res.json({ phone: row.phone || identifier, subscribed: row.subscribed || false });
@@ -1408,7 +1440,7 @@ function laterOfProUntil(a, b) {
   return new Date(Math.max(ta, tb)).toISOString();
 }
 
-app.post('/referral/apply', requireAuth, async (req, res) => {
+app.post('/referral/apply', requireAuth, rateLimit('/referral/apply'), async (req, res) => {
   try {
     const { code } = req.body;
     const id = identityOf(req);
@@ -1549,14 +1581,24 @@ app.post('/meals/sync', requireAuth, async (req, res) => {
     if (dbAvailable) {
       const client = await pool.connect();
       try {
+        // ONE transaction: the old code deleted every meal and then inserted
+        // them one by one on autocommit, so a failure midway (a bad date, a
+        // dropped connection) left the user's history truncated with no way
+        // back. Either the whole sync lands or nothing changes.
+        await client.query('BEGIN');
         await client.query('DELETE FROM meals WHERE phone = $1', [phone]);
         for (const meal of mealList) {
+          if (!meal || typeof meal !== 'object') continue;
           await client.query(
             `INSERT INTO meals (id, phone, date, name, category, calories, protein, carbs, fats, fiber, serving)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
             [meal.id, phone, meal.date, meal.name, meal.category, meal.calories, meal.protein, meal.carbs, meal.fats, meal.fiber, meal.serving]
           );
         }
+        await client.query('COMMIT');
+      } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        throw e;
       } finally {
         client.release();
       }
@@ -1573,8 +1615,15 @@ app.post('/meals/sync', requireAuth, async (req, res) => {
           const batch = firestore.getDb().batch();
           snap.docs.forEach((d) => batch.delete(d.ref));
           for (const m of mealList) {
-            batch.set(col.doc(m.id), {
+            if (!m || typeof m !== 'object' || !m.id) continue;
+            // The doc id is namespaced by uid. This write goes through the
+            // Admin SDK, which bypasses firestore.rules: a client that sent
+            // another user's meal id would otherwise overwrite a stranger's
+            // meal document, because `uid` in the body is what the rule would
+            // have checked and there is no rule here to check it.
+            batch.set(col.doc(fUid + ':' + m.id), {
               uid: fUid,
+              mealId: m.id,
               date: m.date ? new Date(m.date) : new Date(),
               name: m.name || '',
               category: m.category || '',
@@ -1627,7 +1676,11 @@ function normalizeContact(phone) {
   return undefined;
 }
 
-app.post('/payment/create-subscription', requireAuth, async (req, res) => {
+app.post(
+  '/payment/create-subscription',
+  requireAuth,
+  rateLimit('/payment/create-subscription'),
+  async (req, res) => {
   try {
     // The subscription is created for the TOKEN's user: a client-sent phone
     // would otherwise let anyone attach a payment to someone else's account.
@@ -2029,7 +2082,13 @@ app.post('/payment/webhook', async (req, res) => {
       return res.status(500).json({ error: 'Webhook secret not configured' });
     }
 
-    const rawBody = (req.rawBody || Buffer.from(JSON.stringify(req.body))).toString();
+    // The signature covers the EXACT bytes Razorpay sent. Re-serializing
+    // req.body would verify a body we constructed, not the one that arrived, so
+    // a missing raw capture is a rejection rather than a fallback.
+    if (!req.rawBody) {
+      return res.status(400).json({ error: 'Missing raw body' });
+    }
+    const rawBody = req.rawBody.toString();
     const expected = crypto
       .createHmac('sha256', secret)
       .update(rawBody)
@@ -2046,16 +2105,35 @@ app.post('/payment/webhook', async (req, res) => {
     const sub = event?.payload?.subscription?.entity;
     const payment = event?.payload?.payment?.entity;
     const subscriptionId = sub?.id || payment?.subscription_id;
+    // Razorpay retries a webhook until it gets a 2xx, and it does not promise
+    // delivery order. Two consequences the old handler ignored:
+    //   * a retried `subscription.charged` re-activated an account whose
+    //     subscription had since been cancelled;
+    //   * an event that arrives late (after a newer one was applied) rewound
+    //     the state it carried.
+    // Both are settled against what this server has already applied: the
+    // event id is recorded once, and state changes are only applied when the
+    // event is at least as new as the last one applied to that subscription.
+    const eventAt = Number(event?.created_at) || 0;
     // Every processed event is recorded in webhookLog/{id} — a payment that
     // never activates (or an event we can't map to a user) is visible within
     // minutes instead of silently returning { received: true }.
     const logEventId =
       event?.id || ('evt_' + (event?.created_at || Date.now()) + '_' + (subscriptionId || 'none'));
+    // Idempotency: an event id we have already logged is a RETRY, not new
+    // information. Answering 200 (not an error) is what stops Razorpay
+    // retrying it forever.
+    const seen = await firestore.get('webhookLog/' + logEventId);
+    if (seen && seen.seenAt) {
+      return res.json({ received: true, duplicate: true });
+    }
+
     if (!subscriptionId) {
       try {
         await firestore.set('webhookLog/' + logEventId, {
           event: event?.event || '',
           outcome: 'no_subscription',
+          seenAt: new Date(),
           receivedAt: new Date(),
         }, { merge: true });
       } catch (_) {}
@@ -2101,6 +2179,31 @@ app.post('/payment/webhook', async (req, res) => {
       eventType.includes('halted') ||
       eventType.includes('failed');
 
+    // Ordering: never rewind a subscription to an older event than the last
+    // one applied. The marker is written with each state change below.
+    let lastEventAt = 0;
+    if (eventAt) {
+      try {
+        const applied = await firestore.get('subscriptions/' + subscriptionId);
+        lastEventAt = Number(applied && applied.lastEventAt) || 0;
+      } catch (_) {}
+      if (lastEventAt && eventAt < lastEventAt) {
+        try {
+          await firestore.set('webhookLog/' + logEventId, {
+            event: eventType,
+            subscriptionId,
+            phone: phone || null,
+            outcome: 'stale',
+            eventAt,
+            lastEventAt,
+            seenAt: new Date(),
+            receivedAt: new Date(),
+          }, { merge: true });
+        } catch (_) {}
+        return res.json({ received: true, stale: true });
+      }
+    }
+
     let outcome;
     if (!phone) {
       outcome = 'unresolved';
@@ -2121,7 +2224,7 @@ app.post('/payment/webhook', async (req, res) => {
           await firestore.set('users/' + fUid, { subscribed: true, intro_used: true, subscriptionId: subscriptionId || null }, { merge: true });
         }
         if (subscriptionId) {
-          await firestore.set('subscriptions/' + subscriptionId, { uid: fUid || null, identifier: phone, status: sub?.status || 'active', updatedAt: new Date() }, { merge: true });
+          await firestore.set('subscriptions/' + subscriptionId, { uid: fUid || null, identifier: phone, status: sub?.status || 'active', lastEventAt: eventAt || Date.now(), updatedAt: new Date() }, { merge: true });
         }
       }
       outcome = 'activated';
@@ -2157,7 +2260,7 @@ app.post('/payment/webhook', async (req, res) => {
           );
         }
         if (subscriptionId) {
-          await firestore.set('subscriptions/' + subscriptionId, { status: sub?.status || 'cancelled', updatedAt: new Date() }, { merge: true });
+          await firestore.set('subscriptions/' + subscriptionId, { status: sub?.status || 'cancelled', lastEventAt: eventAt || Date.now(), updatedAt: new Date() }, { merge: true });
         }
       }
       outcome = 'deactivated';
@@ -2175,6 +2278,8 @@ app.post('/payment/webhook', async (req, res) => {
         uid: fUid || null,
         outcome,
         status: sub?.status || null,
+        eventAt: eventAt || null,
+        seenAt: new Date(),
         receivedAt: new Date(),
       }, { merge: true });
     } catch (_) {}

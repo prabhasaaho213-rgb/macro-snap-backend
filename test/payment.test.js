@@ -860,3 +860,67 @@ test('referral/generate: creates a code and mirrors it to Firestore', async () =
   assert.match(res.body.referral_code, /^[A-Z2-9]{6}$/);
   assert.ok(fsSets.some((s) => s.path === 'users/uid_a' && typeof s.data.referralCode === 'string'));
 });
+
+// ── Webhook: retries and out-of-order deliveries ────────────────────────
+// Razorpay retries until it sees a 2xx and does not guarantee order. Both
+// cases used to be applied blindly, so a retried `subscription.charged` could
+// re-activate a cancelled account.
+test('webhook: a retried event is acknowledged but not applied twice', async () => {
+  uidMap['123spandana88@gmail.com'] = 'uid1';
+  const body = chargedEvent('sub_dup', { phone: '123spandana88@gmail.com' });
+
+  const first = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), first);
+  assert.equal(first.body.received, true);
+  const setsAfterFirst = fsSets.length;
+
+  const second = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), second);
+  assert.equal(second.statusCode, 200, 'a retry must still answer 2xx, or Razorpay keeps retrying');
+  assert.equal(second.body.duplicate, true);
+  assert.equal(fsSets.length, setsAfterFirst, 'a retry must not write anything');
+});
+
+test('webhook: an older event cannot rewind a newer state', async () => {
+  uidMap['123spandana88@gmail.com'] = 'uid1';
+  // The cancellation was applied later than the charge being replayed.
+  fsDocs.subscriptions = {
+    sub_stale: { uid: 'uid1', status: 'cancelled', lastEventAt: 1700009999 },
+  };
+  const body = chargedEvent('sub_stale', { phone: '123spandana88@gmail.com' });
+  body.created_at = 1700000000;
+
+  const res = makeRes();
+  await webhook(makeReq(body, { sig: sign(body) }), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.stale, true);
+  assert.ok(
+    !fsSets.some((s) => s.path === 'users/uid1' && s.data.subscribed === true),
+    'a stale charge must not switch Pro back on'
+  );
+  assert.equal(lastFsSet((s) => s.path === 'webhookLog/evt_sub_stale').data.outcome, 'stale');
+});
+
+test('webhook: a body that was not captured raw is rejected, never re-serialized', async () => {
+  const body = chargedEvent('sub_noraw', { phone: '123spandana88@gmail.com' });
+  const req = makeReq(body, { sig: sign(body) });
+  delete req.rawBody;
+  const res = makeRes();
+  await webhook(req, res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.error, 'Missing raw body');
+  assert.ok(!fsSets.some((s) => s.path.startsWith('users/')));
+});
+
+// /register writes the name into userIndex, which every later restore reads, so
+// an unbounded name would be stored once and replayed onto every device.
+const register = routes.post['/register'];
+test('register: the stored name is bounded', async () => {
+  uidMap['a@b.com'] = 'uid_a';
+  const res = makeRes();
+  await register(makeReq({ email: 'a@b.com', name: 'x'.repeat(5000) }), res);
+  const idx = lastFsSet((s) => s.path === 'userIndex/a@b.com');
+  assert.ok(idx, 'the index doc must be written');
+  assert.equal(idx.data.name.length, 40);
+});

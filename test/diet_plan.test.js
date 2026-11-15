@@ -235,4 +235,54 @@ test('a deficit is never generated for an underweight user', async () => {
   assert.equal(res.payload.targetCalories, res.payload.tdee, 'maintain means no deficit');
 });
 
+// ── Targets must equal what the app prints ──────────────────────────────
+// The app shows its own DietProfile numbers above this plan and sends them to
+// the user as "your targets", so the plan has to be built from the same
+// figures. These pin the two that used to disagree.
+test('protein uses the app\u2019s 1.8 g/kg on a loss goal', async () => {
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(
+    makeReq({ weight: 70, height: 175, age: 30, gender: 'male', goal: 'loseWeight', activity: 'moderate', diet: 'vegetarian' }),
+    res
+  );
+  assert.equal(res.payload.targetProtein, '126', '70 kg x 1.8 g/kg');
+  assert.match(gemini.prompts[0], /Protein 126g/);
+});
+
+test('protein is capped at 180 g however heavy the user is', async () => {
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(
+    makeReq({ weight: 110, height: 185, age: 30, gender: 'male', goal: 'gainMuscle', activity: 'active', diet: 'nonVegetarian' }),
+    res
+  );
+  assert.equal(res.payload.targetProtein, '180', '110 kg x 2.2 would be 242 g');
+});
+
+test('a loss target never falls below the safe calorie floor', async () => {
+  // 45 kg / 150 cm / 60 / sedentary woman: raw TDEE − 500 is around 400 kcal,
+  // which the app refuses to show and the server used to hand to Gemini.
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(
+    makeReq({ weight: 45, height: 150, age: 60, gender: 'female', goal: 'loseWeight', activity: 'sedentary', diet: 'vegetarian' }),
+    res
+  );
+  assert.equal(res.payload.targetCalories, 1200);
+});
+
+test('the printed BMI decides the underweight guard, not the raw value', async () => {
+  // BMI 18.47 prints "18.5", which the app allows for a loss goal. A raw
+  // compare would quietly downgrade this to maintain and hand back a surplus.
+  gemini.replies.push(vegPlan);
+  const res = makeRes();
+  await handler(
+    makeReq({ weight: 53.38, height: 170, age: 30, gender: 'male', goal: 'loseWeight', activity: 'sedentary', diet: 'vegetarian' }),
+    res
+  );
+  assert.equal(res.payload.bmi, '18.5');
+  assert.ok(res.payload.targetCalories < res.payload.tdee, 'a loss goal must stay a deficit');
+});
+
 test('restored after tests', () => { global.fetch = origFetch; });

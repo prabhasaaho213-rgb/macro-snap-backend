@@ -100,8 +100,11 @@ async function resolveUid(identifier) {
       uidCache.set(key, { uid: null, at: Date.now() }); // negative cache
       return null;
     }
+    // Redacted: the identifier is a phone number or email address, and server
+    // logs are not the place for a user's contact details. The error code is
+    // enough to identify the failure.
     console.error(
-      'Firestore uid resolve failed for ' + identifier + ':',
+      'Firestore uid resolve failed (identifier redacted):',
       (e && e.code) || (e && e.message)
     );
     return null;
