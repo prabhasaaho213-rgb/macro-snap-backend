@@ -583,16 +583,60 @@ const FIRST_MONTH_PRICE = 100; // ₹1 in paise
 // TOMBSTONE_RETENTION_MONTHS are deleted, so the record has a defined lifetime
 // instead of "indefinitely".
 const TOMBSTONE_RETENTION_MONTHS = 24;
-const TOMBSTONE_SECRET =
-  process.env.TOMBSTONE_SECRET ||
-  process.env.RAZORPAY_KEY_SECRET ||
-  'macrosnap-deletion-fingerprint-v1';
+
+// A DEDICATED key, never the Razorpay secret. Reusing that one would silently
+// re-key every fingerprint the day the payment keys rotate — and every deleted
+// account would then be offered ₹1 again, because their tombstone no longer
+// matches. The fallback chain also used to include a constant in this file,
+// which made "cannot be reversed without our key" false: anyone with the source
+// could hash a guessed address and check the table for a match.
+const TOMBSTONE_SECRET = (process.env.TOMBSTONE_SECRET || '').trim();
+const IS_PRODUCTION_ENV =
+  process.env.VERCEL_ENV === 'production' ||
+  process.env.NODE_ENV === 'production';
+
+if (!TOMBSTONE_SECRET && IS_PRODUCTION_ENV) {
+  // Refuse to serve rather than quietly weaken. This throws at module load, so
+  // the deployment fails its health check instead of writing fingerprints
+  // nobody can reproduce.
+  throw new Error(
+    'TOMBSTONE_SECRET is required in production. Generate one with ' +
+      '`openssl rand -hex 32` and set it as an environment variable; it keys ' +
+      'the deletion-tombstone fingerprints and must stay stable (changing it ' +
+      'lets every deleted account claim the ₹1 month again).'
+  );
+}
+
+// Development and tests only: a fixed key, loudly labelled, so local
+// fingerprints are reproducible but can never be mistaken for production's.
+const TOMBSTONE_KEY = TOMBSTONE_SECRET || 'insecure-development-key';
+if (!TOMBSTONE_SECRET) {
+  console.warn(
+    'TOMBSTONE_SECRET not set — using an insecure development key. ' +
+      'Fingerprints created here will not match production.'
+  );
+}
 
 function tombstoneFingerprint(identifier) {
   return crypto
-    .createHmac('sha256', TOMBSTONE_SECRET)
+    .createHmac('sha256', TOMBSTONE_KEY)
     .update(String(identifier).trim().toLowerCase())
     .digest('hex');
+}
+
+// How long a fingerprint still counts against the ₹1 offer. The purge only runs
+// when an account is deleted, so a document can outlive its own window by
+// weeks; this is what makes the policy's "24 months" describe behaviour rather
+// than a cleanup schedule. A missing or unparseable date counts as NOT expired:
+// when in doubt, withhold the offer rather than hand out a second one.
+function tombstoneExpired(deletedAt) {
+  if (!deletedAt) return false;
+  const t =
+    deletedAt instanceof Date
+      ? deletedAt.getTime()
+      : Date.parse(typeof deletedAt === 'string' ? deletedAt : String(deletedAt));
+  if (!Number.isFinite(t)) return false;
+  return Date.now() - t > TOMBSTONE_RETENTION_MONTHS * 30.44 * 24 * 3600 * 1000;
 }
 
 async function introUsedFor({ uid, identifier }) {
@@ -608,15 +652,17 @@ async function introUsedFor({ uid, identifier }) {
           .collection('deletedAccounts')
           .doc(fp)
           .get();
-        if (d.exists) return true;
+        if (d.exists && !tombstoneExpired((d.data() || {}).deleted_at)) {
+          return true;
+        }
       } catch (_) {}
     }
     if (dbAvailable) {
       const t = await dbq(
-        'SELECT 1 FROM deleted_accounts WHERE identifier = $1 LIMIT 1',
+        'SELECT deleted_at FROM deleted_accounts WHERE identifier = $1 LIMIT 1',
         [fp]
       );
-      if (t.rows[0]) return true;
+      if (t.rows[0] && !tombstoneExpired(t.rows[0].deleted_at)) return true;
     }
   }
   if (uid && firestore.isEnabled()) {
@@ -2877,6 +2923,7 @@ module.exports._rateLimits = RATE_WINDOWS;
 module.exports._tombstone = {
   fingerprint: tombstoneFingerprint,
   retentionMonths: TOMBSTONE_RETENTION_MONTHS,
+  expired: tombstoneExpired,
   introUsedFor,
 };
 // Test hook: the pure AI-output sanitizers. They are the only thing standing

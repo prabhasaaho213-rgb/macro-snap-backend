@@ -37,14 +37,34 @@ const firestoreStub = {
   },
   getDb: () => ({
     collection: (name) => ({
-      doc: (id) => ({
-        get: async () => {
+      // Mirrors the real SDK: doc() returns a DocumentReference, which is what
+      // batch.set() receives, so the fake reference must carry its own id.
+      doc: (id) => {
+        const ref = { collection: name, id };
+        ref.ref = ref;
+        ref.get = async () => {
           const d = (fsDocs[name] || {})[id];
-          return { exists: !!d, data: () => d || {} };
-        },
-        set: async () => true,
-        delete: async () => true,
-      }),
+          return { exists: !!d, data: () => d || {}, id, ref };
+        };
+        ref.set = async (data) => {
+          fsDocs[name] = fsDocs[name] || {};
+          fsDocs[name][id] = { ...(fsDocs[name][id] || {}), ...(data || {}) };
+          return true;
+        };
+        ref.delete = async () => true;
+        return ref;
+      },
+      // Full-collection read, used by the legacy-tombstone migration.
+      get: async () => {
+        const col = fsDocs[name] || {};
+        return {
+          docs: Object.keys(col).map((id) => ({
+            id,
+            ref: { collection: name, id },
+            data: () => col[id],
+          })),
+        };
+      },
       // Only the deletedAccounts range query is used: `where('deleted_at','<',cutoff)`
       // for the retention purge. Refuse other fields loudly rather than
       // returning an empty result that would hide a broken purge.
@@ -62,19 +82,30 @@ const firestoreStub = {
       }),
     }),
     batch: () => {
-      const pending = [];
+      const deletes = [];
+      const writes = [];
       return {
         delete: (ref) => {
-          pending.push(ref);
-          return {
-            delete: () => pending.push(ref),
-          };
+          deletes.push(ref);
+          return { delete: () => deletes.push(ref) };
+        },
+        set: (ref, data, opts) => {
+          writes.push({ ref, data, opts });
+          return { set: () => writes.push({ ref, data, opts }) };
         },
         commit: async () => {
-          for (const ref of pending) {
+          for (const w of writes) {
+            fsDocs[w.ref.collection] = fsDocs[w.ref.collection] || {};
+            fsDocs[w.ref.collection][w.ref.id] = {
+              ...(fsDocs[w.ref.collection][w.ref.id] || {}),
+              ...(w.data || {}),
+            };
+          }
+          for (const ref of deletes) {
             if (fsDocs[ref.collection]) delete fsDocs[ref.collection][ref.id];
           }
-          pending.length = 0;
+          deletes.length = 0;
+          writes.length = 0;
           return true;
         },
       };
@@ -212,6 +243,93 @@ test('expired fingerprints are purged, whether or not Postgres is configured', a
   );
   assert.equal(fsDocs.deletedAccounts[expired], undefined);
   assert.ok(fsDocs.deletedAccounts[fresh] === undefined, 'unrelated ids untouched');
+});
+
+test('the 24-month window is enforced at read time, not only by the purge', async () => {
+  // The purge runs when somebody deletes an account, so a document can sit past
+  // its own expiry for weeks. Honouring it until then would make the policy's
+  // "24 months" untrue; the offer must be available again once it is expired.
+  const fp = fingerprint('old@example.com');
+  const longAgo = new Date(Date.now() - 25 * 30.44 * 24 * 3600 * 1000).toISOString();
+  fsDocs.deletedAccounts = { [fp]: { deleted_at: longAgo } };
+
+  assert.equal(
+    await introUsedFor({ uid: null, identifier: 'old@example.com' }),
+    false,
+    'a 25-month-old fingerprint no longer withholds the ₹1 month'
+  );
+
+  // A recent one still does.
+  fsDocs.deletedAccounts = { [fp]: { deleted_at: new Date().toISOString() } };
+  assert.equal(
+    await introUsedFor({ uid: null, identifier: 'old@example.com' }),
+    true
+  );
+});
+
+test('expiry helper: missing or unparseable dates are treated as live', () => {
+  const { expired } = app._tombstone;
+  assert.equal(expired(null), false);
+  assert.equal(expired('not a date'), false);
+  assert.equal(expired(new Date().toISOString()), false);
+  assert.equal(
+    expired(new Date(Date.now() - 25 * 30.44 * 24 * 3600 * 1000).toISOString()),
+    true
+  );
+});
+
+test('legacy cleartext tombstones migrate to fingerprints without losing evidence', async () => {
+  // Nothing printed, nothing dropped: the offer check must still refuse these
+  // two addresses after the old documents are gone.
+  const { migrateLegacyTombstones } = require('../tools/migrate_tombstones');
+  const old = new Date(Date.now() - 400 * 24 * 3600 * 1000).toISOString();
+  fsDocs.deletedAccounts = {
+    'Legacy@Example.com': { deleted_at: old },
+    'legacy@example.com': { deleted_at: old },
+    [fingerprint('already@example.com')]: { deleted_at: old },
+  };
+
+  const res = await migrateLegacyTombstones({
+    db: firestoreStub.getDb(),
+    fingerprint,
+    apply: true,
+  });
+
+  assert.equal(res.scanned, 3);
+  assert.equal(res.legacy, 2);
+  assert.equal(res.migrated, 1, 'the same address in two cases is one fingerprint');
+  assert.equal(res.merged, 1);
+  assert.equal(res.skipped, 1);
+  assert.deepEqual(
+    Object.keys(fsDocs.deletedAccounts).sort(),
+    [fingerprint('already@example.com'), fingerprint('legacy@example.com')].sort(),
+    'only fingerprints remain'
+  );
+  assert.equal(
+    fsDocs.deletedAccounts[fingerprint('legacy@example.com')].deleted_at,
+    old,
+    'the original deletion time is preserved'
+  );
+  assert.equal(
+    await introUsedFor({ uid: null, identifier: 'legacy@example.com' }),
+    true,
+    'the migrated record still withholds the ₹1 month'
+  );
+});
+
+test('migration dry run writes nothing', async () => {
+  const { migrateLegacyTombstones } = require('../tools/migrate_tombstones');
+  fsDocs.deletedAccounts = { 'dry@example.com': { deleted_at: new Date().toISOString() } };
+
+  const res = await migrateLegacyTombstones({
+    db: firestoreStub.getDb(),
+    fingerprint,
+    apply: false,
+  });
+
+  assert.equal(res.legacy, 1);
+  assert.equal(res.migrated, 0);
+  assert.deepEqual(Object.keys(fsDocs.deletedAccounts), ['dry@example.com']);
 });
 
 test('a deleted account is not offered the ₹1 month again', async () => {
