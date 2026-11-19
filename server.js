@@ -637,9 +637,16 @@ function tombstoneCanary() {
     .digest('hex');
 }
 
-/// Writes (or refreshes) meta/tombstone_key_check so the migration can prove
-/// which key is in force. Best effort: a failure is logged, never thrown, and
-/// nothing else in the server depends on it.
+/// Publishes meta/tombstone_key_check so the migration can prove which key is
+/// in force. Best effort: a failure is logged, never thrown, and nothing else in
+/// the server depends on it.
+///
+/// It only ever writes when the document is ABSENT. A stored value that does
+/// not match is a key change — deliberate or not — and overwriting it would
+/// make the canary vouch for whatever key this instance holds, which is the one
+/// thing it exists to prevent. So a mismatch is reported loudly and the document
+/// is left alone; rotating the key means deleting the document on purpose,
+/// after which the next instance publishes the new value.
 async function ensureTombstoneCanary() {
   if (!firestore.isEnabled()) return false;
   try {
@@ -652,6 +659,19 @@ async function ensureTombstoneCanary() {
       // the logs, not inferred from silence.
       console.log('tombstone canary already matches this key');
       return true;
+    }
+    if (current) {
+      // Two ways to get here, and both must stay visible: TOMBSTONE_SECRET was
+      // changed in production, or this code was run locally with production
+      // credentials and no secret (so the development key was used). Writing
+      // here would erase the only evidence of the correct key.
+      console.error(
+        'tombstone canary MISMATCH: meta/tombstone_key_check holds a value from ' +
+          'a different TOMBSTONE_SECRET. Left unchanged (fingerprints made with ' +
+          'this key will not match). If the key was rotated on purpose, delete ' +
+          'meta/tombstone_key_check so the next request publishes the new value.'
+      );
+      return false;
     }
     await ref.set(
       { canary: expected, updated_at: new Date().toISOString() },

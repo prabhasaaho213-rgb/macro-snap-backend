@@ -399,15 +399,97 @@ test('the server publishes a canary the migration can verify', async () => {
   );
 });
 
-test('ensureCanary refreshes a stale value and leaves a matching one alone', async () => {
-  fsDocs.meta = { tombstone_key_check: { canary: 'stale-value' } };
+test('ensureCanary never overwrites a value published by a different key', async () => {
+  // Overwriting would make the canary vouch for whatever key this instance
+  // holds: a TOMBSTONE_SECRET changed by accident, or a laptop run with
+  // production credentials and no secret (the development key). The stored
+  // value is the only evidence of the key the fingerprints were made with, so
+  // it has to survive. Rotating a key means deleting the document on purpose.
+  fsDocs.meta = { tombstone_key_check: { canary: 'published-by-another-key' } };
+
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const wrote = await app._tombstone.ensureCanary();
+    assert.equal(wrote, false);
+    assert.equal(
+      fsDocs.meta.tombstone_key_check.canary,
+      'published-by-another-key',
+      'a mismatched canary is left exactly as it was'
+    );
+    assert.ok(
+      errors.some((line) => line.includes('tombstone canary MISMATCH')),
+      'the mismatch is logged loudly, not swallowed'
+    );
+
+    // A second boot must not rewrite it either.
+    const writesBefore = fsSetsBefore();
+    await app._tombstone.ensureCanary();
+    assert.equal(fsSetsBefore(), writesBefore, 'still not overwritten');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('an absent canary is still published', async () => {
+  delete fsDocs.meta;
   await app._tombstone.ensureCanary();
   assert.equal(fsDocs.meta.tombstone_key_check.canary, app._tombstone.canary());
+});
 
-  fsCommits.length = 0;
-  const writesBefore = fsSetsBefore();
-  await app._tombstone.ensureCanary();
-  assert.equal(fsSetsBefore(), writesBefore, 'a matching canary is not rewritten');
+test('verifyCanary reports a read failure as error, not missing', async () => {
+  // A permission or network failure says nothing about whether the canary
+  // exists. Calling it "missing" would let an access problem skip the guard.
+  const { verifyCanary } = require('../tools/migrate_tombstones');
+  const unreadable = {
+    collection: () => ({
+      doc: () => ({
+        get: async () => {
+          throw new Error('PERMISSION_DENIED');
+        },
+      }),
+    }),
+  };
+
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    assert.equal(await verifyCanary({ db: unreadable, secret: 'k' }), 'error');
+    assert.ok(errors.some((line) => line.includes('PERMISSION_DENIED')));
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('the migration refuses to apply without a usable canary', () => {
+  const { canaryRefusal } = require('../tools/migrate_tombstones');
+
+  assert.equal(canaryRefusal('ok', { apply: true }), null);
+  assert.match(
+    canaryRefusal('missing', { apply: true }),
+    /does not exist/,
+    'the server has not booted with this key — the documented flow used to warn here'
+  );
+  assert.match(canaryRefusal('error', { apply: true }), /could not be read/);
+  assert.match(canaryRefusal('mismatch', { apply: true }), /does not match/);
+
+  assert.equal(
+    canaryRefusal('missing', { apply: true, force: true }),
+    null,
+    '--force is the documented override'
+  );
+  assert.equal(
+    canaryRefusal('missing', { apply: false }),
+    null,
+    'a dry run writes nothing, so a missing canary does not stop it'
+  );
+  assert.match(
+    canaryRefusal('mismatch', { apply: false }),
+    /does not match/,
+    'a wrong key is alarming even in a dry run'
+  );
 });
 
 test('migration never shortens an existing retention date', async () => {
@@ -429,7 +511,7 @@ test('migration never shortens an existing retention date', async () => {
     apply: true,
   });
 
-  assert.equal(res.merged, 1);
+  assert.equal(res.merged, 0, 'an existing fingerprint is a re-run, not a duplicate');
   assert.equal(fsDocs.deletedAccounts[fp].deleted_at, newer);
 });
 
