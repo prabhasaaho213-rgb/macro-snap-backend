@@ -665,11 +665,28 @@ async function ensureTombstoneCanary() {
   }
 }
 
-// Fire-and-forget on cold start. Awaited by nothing, so a slow or failing
-// Firestore can never delay the first request.
-Promise.resolve()
-  .then(ensureTombstoneCanary)
-  .catch(() => {});
+// The canary is written during the first request, not at module load. A
+// serverless instance is frozen as soon as it answers, and an un-awaited write
+// started at import time is exactly the work that gets dropped — the earlier
+// version logged nothing either way, which is the worst of both. It is awaited
+// once per instance with a short cap, so a slow Firestore costs one request a
+// few hundred milliseconds rather than delaying every request.
+const CANARY_WAIT_MS = 750;
+let tombstoneCanaryPromise = null;
+
+function canaryOnce() {
+  if (!tombstoneCanaryPromise) {
+    tombstoneCanaryPromise = Promise.race([
+      ensureTombstoneCanary(),
+      new Promise((resolve) => setTimeout(() => resolve(false), CANARY_WAIT_MS)),
+    ]).catch(() => false);
+  }
+  return tombstoneCanaryPromise;
+}
+
+app.use((req, res, next) => {
+  canaryOnce().then(() => next(), () => next());
+});
 
 function tombstoneFingerprint(identifier) {
   return crypto
