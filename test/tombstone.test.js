@@ -15,6 +15,7 @@ const Module = require('node:module');
 // ── In-memory Firestore fake (same shape as payment.test.js) ────────────
 const fsDocs = {};
 const fsSets = [];
+const fsCommits = []; // operations per commit()
 const firestoreStub = {
   init: () => true,
   isEnabled: () => true,
@@ -94,6 +95,7 @@ const firestoreStub = {
           return { set: () => writes.push({ ref, data, opts }) };
         },
         commit: async () => {
+          fsCommits.push(deletes.length + writes.length);
           for (const w of writes) {
             fsDocs[w.ref.collection] = fsDocs[w.ref.collection] || {};
             fsDocs[w.ref.collection][w.ref.id] = {
@@ -154,6 +156,7 @@ assert.ok(deleteAccount, '/account/delete handler must be registered');
 beforeEach(() => {
   for (const k of Object.keys(fsDocs)) delete fsDocs[k];
   fsSets.length = 0;
+  fsCommits.length = 0;
 });
 
 function makeReq(user) {
@@ -317,6 +320,57 @@ test('legacy cleartext tombstones migrate to fingerprints without losing evidenc
   );
 });
 
+test('migration commits in chunks that stay under the Firestore op limit', async () => {
+  // The collection is small today; this is the failure that would only show up
+  // in a year, as a commit rejection halfway through a migration.
+  const { migrateLegacyTombstones, MAX_OPS_PER_COMMIT } = require('../tools/migrate_tombstones');
+  const legacy = {};
+  for (let i = 0; i < 600; i += 1) {
+    legacy[`user${i}@example.com`] = { deleted_at: new Date().toISOString() };
+  }
+  fsDocs.deletedAccounts = legacy;
+
+  const res = await migrateLegacyTombstones({
+    db: firestoreStub.getDb(),
+    fingerprint,
+    apply: true,
+  });
+
+  assert.equal(res.legacy, 600);
+  assert.equal(res.migrated, 600);
+  assert.equal(res.commits, 3, '600 records at 2 ops each is three 400-op commits');
+  assert.ok(
+    fsCommits.every((n) => n <= MAX_OPS_PER_COMMIT),
+    `no commit may exceed ${MAX_OPS_PER_COMMIT} operations, got ${fsCommits.join(', ')}`
+  );
+  assert.equal(Object.keys(fsDocs.deletedAccounts).length, 600);
+});
+
+test('merged duplicates keep the LATER deletion date, whatever the read order', async () => {
+  const { migrateLegacyTombstones } = require('../tools/migrate_tombstones');
+  const older = '2025-01-01T00:00:00.000Z';
+  const newer = '2026-06-01T00:00:00.000Z';
+  // Firestore returns documents in id order, so the older-looking id comes
+  // first here and the newer one second.
+  fsDocs.deletedAccounts = {
+    'a@@example.com': { deleted_at: newer },
+    'z@@example.com': { deleted_at: older },
+  };
+
+  const res = await migrateLegacyTombstones({
+    db: firestoreStub.getDb(),
+    fingerprint: () => 'd'.repeat(64),
+    apply: true,
+  });
+
+  assert.equal(res.merged, 1);
+  assert.equal(
+    fsDocs.deletedAccounts['d'.repeat(64)].deleted_at,
+    newer,
+    'the most recent deletion wins'
+  );
+});
+
 test('migration dry run writes nothing', async () => {
   const { migrateLegacyTombstones } = require('../tools/migrate_tombstones');
   fsDocs.deletedAccounts = { 'dry@example.com': { deleted_at: new Date().toISOString() } };
@@ -330,6 +384,44 @@ test('migration dry run writes nothing', async () => {
   assert.equal(res.legacy, 1);
   assert.equal(res.migrated, 0);
   assert.deepEqual(Object.keys(fsDocs.deletedAccounts), ['dry@example.com']);
+});
+
+test('a failing purge is logged, and the deletion still succeeds', async () => {
+  // The purge is best-effort by design: a retention cleanup must never turn a
+  // user's account deletion into an error. But it must not vanish either — a
+  // silently broken purge is a retention promise nobody can see breaking.
+  const original = firestoreStub.getDb;
+  const errors = [];
+  const realError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  firestoreStub.getDb = () => {
+    const db = original();
+    return {
+      ...db,
+      collection: (name) => ({
+        ...db.collection(name),
+        where: () => {
+          throw new Error('firestore unavailable');
+        },
+      }),
+    };
+  };
+
+  try {
+    const res = makeRes();
+    await deleteAccount(
+      makeReq({ uid: 'uid_fail', email: 'failing@example.com', email_verified: true }),
+      res
+    );
+    assert.equal(res.statusCode, 200, 'account deletion must still succeed');
+    assert.ok(
+      errors.some((m) => m.includes('tombstone purge failed (Firestore)')),
+      `expected a logged purge failure, got: ${errors.join(' | ') || '(nothing)'}`
+    );
+  } finally {
+    firestoreStub.getDb = original;
+    console.error = realError;
+  }
 });
 
 test('a deleted account is not offered the ₹1 month again', async () => {

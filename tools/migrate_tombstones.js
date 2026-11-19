@@ -24,6 +24,13 @@
 
 const FINGERPRINT_RE = /^[0-9a-f]{64}$/;
 
+// A Firestore commit allows 500 operations, and this migration uses two per
+// legacy record (set the fingerprint, delete the old document). 200 records per
+// commit is 400 operations — under the limit with room to spare, and it means a
+// collection larger than 250 records does not fail halfway through.
+const MAX_OPS_PER_COMMIT = 400;
+const RECORDS_PER_COMMIT = MAX_OPS_PER_COMMIT / 2;
+
 function isFingerprint(id) {
   return FINGERPRINT_RE.test(String(id || ''));
 }
@@ -39,12 +46,32 @@ function isFingerprint(id) {
 async function migrateLegacyTombstones({ db, fingerprint, apply = false }) {
   const snapshot = await db.collection('deletedAccounts').get();
   const docs = (snapshot && snapshot.docs) || [];
-  const result = { scanned: docs.length, legacy: 0, migrated: 0, merged: 0, skipped: 0 };
+  const existingIds = new Set(docs.map((d) => d.id));
+  const result = {
+    scanned: docs.length,
+    legacy: 0,
+    migrated: 0,
+    merged: 0,
+    skipped: 0,
+    commits: 0,
+    // True when some legacy document's fingerprint is already present, which
+    // proves this run is using the same TOMBSTONE_SECRET as the server.
+    keyConfirmed: null,
+  };
 
-  // Fingerprints written during this run, so two legacy ids that normalise to
-  // the same address (e.g. differing case) merge instead of racing.
-  const batch = apply ? db.batch() : null;
-  const pending = new Map();
+  // One entry per fingerprint written during this run, so two legacy ids that
+  // normalise to the same address merge instead of racing.
+  const latest = new Map();
+  let batch = apply ? db.batch() : null;
+  let ops = 0;
+
+  const flush = async () => {
+    if (!apply || !batch || ops === 0) return;
+    await batch.commit();
+    result.commits += 1;
+    batch = db.batch();
+    ops = 0;
+  };
 
   for (const doc of docs) {
     const id = doc.id;
@@ -55,23 +82,34 @@ async function migrateLegacyTombstones({ db, fingerprint, apply = false }) {
     result.legacy += 1;
     const data = (doc.data && doc.data()) || {};
     const fp = fingerprint(id);
-    if (pending.has(fp)) {
-      result.merged += 1;
-    } else {
-      pending.set(fp, data.deleted_at || new Date().toISOString());
-    }
-    if (batch) {
+    if (existingIds.has(fp)) result.keyConfirmed = true;
+
+    const date = data.deleted_at || new Date().toISOString();
+    const previous = latest.get(fp);
+    if (previous) result.merged += 1;
+    // Keep the LATER deletion date: the record exists to say "this identity has
+    // deleted", and when the same address deleted twice, the recent deletion is
+    // the one worth remembering. (Reading order in Firestore is by document id,
+    // so "first one wins" would pick an arbitrary date.)
+    const keep = previous && previous > date ? previous : date;
+    latest.set(fp, keep);
+
+    if (apply) {
+      // Both operations are always issued — a duplicate still has an old
+      // document to delete — so each legacy record costs exactly 2 ops.
       batch.set(
         db.collection('deletedAccounts').doc(fp),
-        { deleted_at: pending.get(fp) },
+        { deleted_at: keep },
         { merge: true }
       );
       batch.delete(doc.ref);
+      ops += 2;
+      if (ops >= MAX_OPS_PER_COMMIT) await flush();
     }
   }
 
-  if (batch && pending.size > 0) await batch.commit();
-  result.migrated = apply ? pending.size : 0;
+  await flush();
+  result.migrated = apply ? latest.size : 0;
   return result;
 }
 
@@ -113,8 +151,14 @@ async function main() {
       `scanned   ${res.scanned}`,
       `already-fingerprinted ${res.skipped}`,
       `legacy    ${res.legacy}`,
-      res.merged ? `merged    ${res.merged} (same address, different case)` : null,
-      apply ? `migrated  ${res.migrated}` : 'dry run — pass --apply to write',
+      res.merged ? `merged    ${res.merged} (same address, two records)` : null,
+      apply ? `migrated  ${res.migrated} fingerprints in ${res.commits} commit(s)` : 'dry run — pass --apply to write',
+      res.keyConfirmed === true
+        ? 'key       confirmed against an existing fingerprint'
+        : res.legacy > 0
+          ? 'key       NOT confirmed: no legacy address matched an existing fingerprint,\n' +
+            '          so a wrong TOMBSTONE_SECRET would look exactly like this. Check the value.'
+          : null,
     ]
       .filter(Boolean)
       .join('\n')
@@ -128,4 +172,9 @@ if (require.main === module) {
   });
 }
 
-module.exports = { migrateLegacyTombstones, isFingerprint };
+module.exports = {
+  migrateLegacyTombstones,
+  isFingerprint,
+  MAX_OPS_PER_COMMIT,
+  RECORDS_PER_COMMIT,
+};

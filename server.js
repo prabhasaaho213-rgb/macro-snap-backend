@@ -2574,12 +2574,23 @@ app.post('/account/delete', requireAuth, async (req, res) => {
           .collection('deletedAccounts')
           .where('deleted_at', '<', cutoff)
           .get();
-        if (snap && snap.docs && snap.docs.length > 0) {
+        const expired = (snap && snap.docs) || [];
+        // Firestore commits cap at 500 operations, so a busy year's worth of
+        // expired records cannot go in one batch. 400 leaves room to spare.
+        for (let i = 0; i < expired.length; i += 400) {
           const batch = db.batch();
-          snap.docs.forEach((d) => batch.delete(d.ref));
+          expired.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
           await batch.commit();
         }
-      } catch (_) {}
+      } catch (e) {
+        // A purge that fails silently is a retention promise nobody can see
+        // breaking. The deletion itself still succeeds — this must never turn
+        // into a failed account deletion — but it has to be in the logs.
+        console.error(
+          'tombstone purge failed (Firestore):',
+          e && e.message ? e.message : e
+        );
+      }
     }
     if (dbAvailable) {
       try {
@@ -2595,7 +2606,14 @@ app.post('/account/delete', requireAuth, async (req, res) => {
            WHERE deleted_at < NOW() - ($1 || ' months')::interval`,
           [String(TOMBSTONE_RETENTION_MONTHS)]
         );
-      } catch (_) {}
+      } catch (e) {
+        // Same rule as the Firestore half: never fail the deletion, always
+        // leave a trace that the purge did not run.
+        console.error(
+          'tombstone purge failed (Postgres):',
+          e && e.message ? e.message : e
+        );
+      }
     }
 
     // 3) Wipe personal data — Postgres.
