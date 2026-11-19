@@ -97,6 +97,9 @@ Module._load = function (request, parent, isMain) {
 };
 
 process.env.GEMINI_KEY = 'test-key';
+// The delete handler writes tombstones only with a real key (a development key
+// enforces nothing), so the trial tests need the same shape as production.
+process.env.TOMBSTONE_SECRET = 'test-tombstone-secret';
 delete process.env.DATABASE_URL;
 
 // ── Fake Gemini: records request bodies, replies from a queue ───────────

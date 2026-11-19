@@ -648,6 +648,18 @@ function tombstoneCanary() {
 /// is left alone; rotating the key means deleting the document on purpose,
 /// after which the next instance publishes the new value.
 async function ensureTombstoneCanary() {
+  // Only a real key may vouch for itself. A preview deployment or a laptop run
+  // that shares production credentials has no TOMBSTONE_SECRET and falls back
+  // to the development key; if it published first, production would then see a
+  // mismatch and (correctly) refuse to overwrite it — leaving a document that
+  // vouches for the wrong key and a migration nothing can verify. So without a
+  // real key the canary is not touched at all.
+  if (!TOMBSTONE_SECRET) {
+    console.log(
+      "tombstone canary not published: TOMBSTONE_SECRET is unset (the development key cannot vouch for anything)"
+    );
+    return false;
+  }
   if (!firestore.isEnabled()) return false;
   try {
     const ref = firestore.getDb().collection(TOMBSTONE_CANARY_COLLECTION).doc(TOMBSTONE_CANARY_DOC);
@@ -2644,7 +2656,20 @@ app.post('/account/delete', requireAuth, async (req, res) => {
     //    identity spent the ₹1 month?" and useless for anything else. See
     //    tombstoneFingerprint() for why, and for the retention window.
     const fingerprint = tombstoneFingerprint(identifier);
-    if (firestore.isEnabled()) {
+    // Without a real key a fingerprint enforces nothing (anyone with the
+    // source can reproduce the development key), and writing one also deletes
+    // the legacy cleartext document — the only remaining evidence that this
+    // account deleted. So a run using the development key leaves the tombstone
+    // store completely alone, and says why.
+    const tombstonesEnforce = Boolean(TOMBSTONE_SECRET);
+    if (!tombstonesEnforce && (firestore.isEnabled() || dbAvailable)) {
+      console.error(
+        "tombstone NOT written: TOMBSTONE_SECRET is unset, so the fingerprint would " +
+          "use the insecure development key and enforce nothing. Set TOMBSTONE_SECRET " +
+          "to the production value, or do not point this run at a real database."
+      );
+    }
+    if (tombstonesEnforce && firestore.isEnabled()) {
       await firestore.set('deletedAccounts/' + fingerprint, {
         deleted_at: new Date().toISOString(),
       });
@@ -2688,7 +2713,7 @@ app.post('/account/delete', requireAuth, async (req, res) => {
         );
       }
     }
-    if (dbAvailable) {
+    if (tombstonesEnforce && dbAvailable) {
       try {
         await dbq(
           `INSERT INTO deleted_accounts (identifier) VALUES ($1)

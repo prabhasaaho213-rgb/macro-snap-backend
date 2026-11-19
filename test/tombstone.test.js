@@ -145,7 +145,10 @@ Module._load = function (request) {
 process.env.RAZORPAY_KEY_ID = 'rzp_test_key';
 process.env.RAZORPAY_KEY_SECRET = 'rzp_test_secret';
 delete process.env.DATABASE_URL;
-delete process.env.TOMBSTONE_SECRET;
+// A real key, as production has: the development key publishes no canary and
+// writes no tombstones, and both of those are tested by loading a second copy
+// of the server without this variable (see loadDevKeyServer).
+process.env.TOMBSTONE_SECRET = 'test-tombstone-secret';
 
 const app = require('../server.js');
 const deleteAccount = routes.post['/account/delete'];
@@ -376,7 +379,7 @@ test('the server publishes a canary the migration can verify', async () => {
   // handler removes the legacy document), so the key is proven by a value only
   // the right key produces.
   const { verifyCanary } = require('../tools/migrate_tombstones');
-  const devKey = 'insecure-development-key'; // what server.js uses without TOMBSTONE_SECRET
+  const devKey = 'test-tombstone-secret'; // the key this test loaded server.js with
 
   await app._tombstone.ensureCanary();
   const stored = fsDocs.meta.tombstone_key_check.canary;
@@ -396,6 +399,110 @@ test('the server publishes a canary the migration can verify', async () => {
   assert.equal(
     await verifyCanary({ db: firestoreStub.getDb(), secret: devKey }),
     'missing'
+  );
+});
+
+/**
+ * A second copy of the server, loaded with no TOMBSTONE_SECRET so it uses the
+ * development key. The module reads the secret at load, and the shared stubs
+ * make a reload cheap.
+ */
+function loadDevKeyServer() {
+  const saved = process.env.TOMBSTONE_SECRET;
+  const serverPath = require.resolve('../server.js');
+  delete process.env.TOMBSTONE_SECRET;
+  delete require.cache[serverPath];
+  const savedWarn = console.warn;
+  const savedLog = console.log;
+  console.warn = () => {}; // "using an insecure development key"
+  console.log = () => {};
+  let devApp;
+  try {
+    devApp = require('../server.js');
+  } finally {
+    console.warn = savedWarn;
+    console.log = savedLog;
+    process.env.TOMBSTONE_SECRET = saved;
+    delete require.cache[serverPath];
+  }
+  const devFingerprint = require('node:crypto')
+    .createHmac('sha256', 'insecure-development-key')
+    .update('x')
+    .digest('hex');
+  assert.equal(
+    devApp._tombstone.fingerprint('x'),
+    devFingerprint,
+    'the reloaded server really is using the development key'
+  );
+  return devApp;
+}
+
+/**
+ * Reloads with the secret back in place. The stubs share one app object, so a
+ * dev-key load replaces `_tombstone` on it; this puts the real one back for the
+ * tests that run afterwards.
+ */
+function restoreRealServer() {
+  const serverPath = require.resolve('../server.js');
+  delete require.cache[serverPath];
+  require('../server.js');
+  delete require.cache[serverPath];
+}
+
+test('a development key never publishes the canary', async () => {
+  // The first process to boot wins the document. A preview deployment or a
+  // laptop sharing production credentials must not be able to put the
+  // development key's canary there, or production would see a permanent
+  // mismatch and be left with a document that vouches for the wrong key.
+  const realCanary = app._tombstone.canary();
+  fsDocs.meta = { tombstone_key_check: { canary: realCanary } };
+  const devApp = loadDevKeyServer();
+  try {
+    const written = await devApp._tombstone.ensureCanary();
+    assert.equal(written, false);
+    assert.equal(
+      fsDocs.meta.tombstone_key_check.canary,
+      realCanary,
+      'the published value is left alone'
+    );
+  } finally {
+    restoreRealServer();
+  }
+});
+
+test('a development key writes no tombstones into a real database', async () => {
+  // A dev-key fingerprint enforces nothing, and writing it would also delete the
+  // legacy cleartext document — the only evidence this account ever deleted.
+  const devApp = loadDevKeyServer();
+  const devDelete = routes.post['/account/delete'];
+  fsDocs.deletedAccounts = { 'dev@example.com': { email: 'dev@example.com' } };
+
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    await devDelete(
+      makeReq({ uid: 'uid_dev', email: 'dev@example.com', email_verified: true }),
+      makeRes()
+    );
+  } finally {
+    console.error = originalError;
+    restoreRealServer();
+  }
+
+  assert.equal(
+    fsDocs.deletedAccounts['dev@example.com'].email,
+    'dev@example.com',
+    'the legacy document is not deleted'
+  );
+  assert.equal(
+    fsDocs.deletedAccounts[devApp._tombstone.fingerprint('dev@example.com')],
+    undefined,
+    'no fingerprint is written'
+  );
+  assert.ok(
+    errors.some((line) => line.includes('tombstone NOT written')),
+    'the refusal is logged, not silent'
   );
 });
 
