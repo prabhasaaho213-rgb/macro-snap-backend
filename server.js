@@ -647,7 +647,12 @@ async function ensureTombstoneCanary() {
     const doc = await ref.get();
     const current = (doc && doc.exists && (doc.data() || {}).canary) || null;
     const expected = tombstoneCanary();
-    if (current === expected) return true;
+    if (current === expected) {
+      // Logged once per instance so "the canary is in place" is answerable from
+      // the logs, not inferred from silence.
+      console.log('tombstone canary already matches this key');
+      return true;
+    }
     await ref.set(
       { canary: expected, updated_at: new Date().toISOString() },
       { merge: true }
