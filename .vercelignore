@@ -1,0 +1,13 @@
+# Never upload local secrets with a deployment.
+# `vercel --prod` uploads this directory, and .env.local is where
+# `vercel env pull` writes the Firebase service-account key.
+.env
+.env.*
+.env*
+
+# Local state and tooling that the function does not need.
+.vercel
+node_modules
+test
+coverage
+*.log
