@@ -617,6 +617,60 @@ if (!TOMBSTONE_SECRET) {
   );
 }
 
+// ── Key canary ─────────────────────────────────────────────────────
+// A migration run with the wrong TOMBSTONE_SECRET writes fingerprints the
+// server will never match, and that mistake is invisible from the data: in the
+// normal case no legacy record's fingerprint already exists (the delete handler
+// removes the legacy document when that account deletes again), so a correct run
+// looks exactly like a wrong one.
+//
+// So the server publishes a value only the right key can produce, and the
+// migration compares. The constant is not a secret — the HMAC is.
+const TOMBSTONE_CANARY_CONSTANT = 'macrosnap-tombstone-key-check-v1';
+const TOMBSTONE_CANARY_COLLECTION = 'meta';
+const TOMBSTONE_CANARY_DOC = 'tombstone_key_check';
+
+function tombstoneCanary() {
+  return crypto
+    .createHmac('sha256', TOMBSTONE_KEY)
+    .update(TOMBSTONE_CANARY_CONSTANT)
+    .digest('hex');
+}
+
+/// Writes (or refreshes) meta/tombstone_key_check so the migration can prove
+/// which key is in force. Best effort: a failure is logged, never thrown, and
+/// nothing else in the server depends on it.
+async function ensureTombstoneCanary() {
+  if (!firestore.isEnabled()) return false;
+  try {
+    const ref = firestore.getDb().collection(TOMBSTONE_CANARY_COLLECTION).doc(TOMBSTONE_CANARY_DOC);
+    const doc = await ref.get();
+    const current = (doc && doc.exists && (doc.data() || {}).canary) || null;
+    const expected = tombstoneCanary();
+    if (current === expected) return true;
+    await ref.set(
+      { canary: expected, updated_at: new Date().toISOString() },
+      { merge: true }
+    );
+    // Observable on purpose: "did this deployment publish the canary" is a
+    // question worth being able to answer from the logs alone.
+    console.log('tombstone canary written to meta/tombstone_key_check');
+    return true;
+  } catch (e) {
+    console.error(
+      'tombstone canary write failed:',
+      e && e.message ? e.message : e
+    );
+    return false;
+  }
+}
+
+// Fire-and-forget on cold start. Awaited by nothing, so a slow or failing
+// Firestore can never delay the first request.
+Promise.resolve()
+  .then(ensureTombstoneCanary)
+  .catch(() => {});
+
 function tombstoneFingerprint(identifier) {
   return crypto
     .createHmac('sha256', TOMBSTONE_KEY)
@@ -2942,6 +2996,8 @@ module.exports._tombstone = {
   fingerprint: tombstoneFingerprint,
   retentionMonths: TOMBSTONE_RETENTION_MONTHS,
   expired: tombstoneExpired,
+  canary: tombstoneCanary,
+  ensureCanary: ensureTombstoneCanary,
   introUsedFor,
 };
 // Test hook: the pure AI-output sanitizers. They are the only thing standing

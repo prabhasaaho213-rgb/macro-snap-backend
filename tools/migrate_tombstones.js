@@ -35,6 +35,40 @@ function isFingerprint(id) {
   return FINGERPRINT_RE.test(String(id || ''));
 }
 
+// Must match TOMBSTONE_CANARY_CONSTANT / tombstoneCanary() in ../server.js.
+const CANARY_CONSTANT = 'macrosnap-tombstone-key-check-v1';
+const CANARY_COLLECTION = 'meta';
+const CANARY_DOC = 'tombstone_key_check';
+
+function canaryFor(secret) {
+  return require('node:crypto')
+    .createHmac('sha256', secret)
+    .update(CANARY_CONSTANT)
+    .digest('hex');
+}
+
+/**
+ * Compares the key this run is using against the value the deployed server
+ * published. Returns 'ok', 'mismatch' or 'missing'.
+ *
+ * Overlap between a legacy address and an existing fingerprint is NOT a
+ * usable signal — the delete handler removes the legacy document when that
+ * account deletes again, so a correct run normally has no overlap at all.
+ */
+async function verifyCanary({ db, secret }) {
+  try {
+    const doc = await db
+      .collection(CANARY_COLLECTION)
+      .doc(CANARY_DOC)
+      .get();
+    const stored = doc && doc.exists ? (doc.data() || {}).canary : null;
+    if (!stored) return 'missing';
+    return stored === canaryFor(secret) ? 'ok' : 'mismatch';
+  } catch (_) {
+    return 'missing';
+  }
+}
+
 /**
  * Pure core, so it can be tested against a fake Firestore.
  *
@@ -47,6 +81,19 @@ async function migrateLegacyTombstones({ db, fingerprint, apply = false }) {
   const snapshot = await db.collection('deletedAccounts').get();
   const docs = (snapshot && snapshot.docs) || [];
   const existingIds = new Set(docs.map((d) => d.id));
+
+  // Fingerprints that already exist (written by the server for an account
+  // deleted after this build). Seeding the map with their dates is what stops
+  // a legacy record from rewriting a NEWER deletion with an older date.
+  const latest = new Map();
+  for (const d of docs) {
+    if (!isFingerprint(d.id)) continue;
+    const at = ((d.data && d.data()) || {}).deleted_at;
+    if (at) latest.set(d.id, at);
+  }
+  // Fingerprints this run is responsible for, so "migrated" counts legacy
+  // records rather than also counting documents that already existed.
+  const legacyFingerprints = new Set();
   const result = {
     scanned: docs.length,
     legacy: 0,
@@ -59,9 +106,6 @@ async function migrateLegacyTombstones({ db, fingerprint, apply = false }) {
     keyConfirmed: null,
   };
 
-  // One entry per fingerprint written during this run, so two legacy ids that
-  // normalise to the same address merge instead of racing.
-  const latest = new Map();
   let batch = apply ? db.batch() : null;
   let ops = 0;
 
@@ -84,6 +128,7 @@ async function migrateLegacyTombstones({ db, fingerprint, apply = false }) {
     const fp = fingerprint(id);
     if (existingIds.has(fp)) result.keyConfirmed = true;
 
+    legacyFingerprints.add(fp);
     const date = data.deleted_at || new Date().toISOString();
     const previous = latest.get(fp);
     if (previous) result.merged += 1;
@@ -109,7 +154,7 @@ async function migrateLegacyTombstones({ db, fingerprint, apply = false }) {
   }
 
   await flush();
-  result.migrated = apply ? latest.size : 0;
+  result.migrated = apply ? legacyFingerprints.size : 0;
   return result;
 }
 
@@ -140,11 +185,31 @@ async function main() {
       .update(String(identifier).trim().toLowerCase())
       .digest('hex');
 
-  const res = await migrateLegacyTombstones({
-    db: firestore.getDb(),
-    fingerprint,
-    apply,
-  });
+  const db = firestore.getDb();
+
+  // Refuse to write with a key the running server does not share. This is the
+  // failure that would otherwise be silent: every fingerprint written here
+  // would be a value nothing ever looks up.
+  const canary = await verifyCanary({ db, secret });
+  const force = process.argv.includes('--force');
+  if (canary === 'mismatch') {
+    console.error(
+      'TOMBSTONE_SECRET does not match the key the deployed server published\n' +
+        'in meta/tombstone_key_check. Running this would write fingerprints the\n' +
+        'server can never match, silently re-opening the ₹1 month. Nothing was\n' +
+        'written. Use the value from `vercel env pull`, or pass --force if you\n' +
+        'know the canary is stale.'
+    );
+    if (!force) process.exit(1);
+  }
+  if (canary === 'missing' && apply) {
+    console.warn(
+      'warning: meta/tombstone_key_check is missing — the server has not booted\n' +
+        '         with this key yet, so it could not be verified. Continuing.'
+    );
+  }
+
+  const res = await migrateLegacyTombstones({ db, fingerprint, apply });
 
   console.log(
     [
@@ -152,13 +217,16 @@ async function main() {
       `already-fingerprinted ${res.skipped}`,
       `legacy    ${res.legacy}`,
       res.merged ? `merged    ${res.merged} (same address, two records)` : null,
-      apply ? `migrated  ${res.migrated} fingerprints in ${res.commits} commit(s)` : 'dry run — pass --apply to write',
-      res.keyConfirmed === true
-        ? 'key       confirmed against an existing fingerprint'
-        : res.legacy > 0
-          ? 'key       NOT confirmed: no legacy address matched an existing fingerprint,\n' +
-            '          so a wrong TOMBSTONE_SECRET would look exactly like this. Check the value.'
-          : null,
+      apply
+        ? `migrated  ${res.migrated} fingerprints in ${res.commits} commit(s)`
+        : 'dry run — pass --apply to write',
+      `key       ${
+        canary === 'ok'
+          ? 'verified against the server canary'
+          : canary === 'mismatch'
+            ? 'MISMATCH — refused (see above)'
+            : 'unverified (no canary yet)'
+      }`,
     ]
       .filter(Boolean)
       .join('\n')
@@ -175,6 +243,8 @@ if (require.main === module) {
 module.exports = {
   migrateLegacyTombstones,
   isFingerprint,
+  verifyCanary,
+  canaryFor,
   MAX_OPS_PER_COMMIT,
   RECORDS_PER_COMMIT,
 };

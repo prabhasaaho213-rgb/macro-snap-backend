@@ -371,6 +371,72 @@ test('merged duplicates keep the LATER deletion date, whatever the read order', 
   );
 });
 
+test('the server publishes a canary the migration can verify', async () => {
+  // Overlap with an existing fingerprint is NOT a usable signal (the delete
+  // handler removes the legacy document), so the key is proven by a value only
+  // the right key produces.
+  const { verifyCanary } = require('../tools/migrate_tombstones');
+  const devKey = 'insecure-development-key'; // what server.js uses without TOMBSTONE_SECRET
+
+  await app._tombstone.ensureCanary();
+  const stored = fsDocs.meta.tombstone_key_check.canary;
+  assert.equal(stored, app._tombstone.canary(), 'the canary is an HMAC of the constant');
+
+  assert.equal(
+    await verifyCanary({ db: firestoreStub.getDb(), secret: devKey }),
+    'ok'
+  );
+  assert.equal(
+    await verifyCanary({ db: firestoreStub.getDb(), secret: 'some-other-key' }),
+    'mismatch',
+    'a different key must be refused, not merged'
+  );
+
+  delete fsDocs.meta;
+  assert.equal(
+    await verifyCanary({ db: firestoreStub.getDb(), secret: devKey }),
+    'missing'
+  );
+});
+
+test('ensureCanary refreshes a stale value and leaves a matching one alone', async () => {
+  fsDocs.meta = { tombstone_key_check: { canary: 'stale-value' } };
+  await app._tombstone.ensureCanary();
+  assert.equal(fsDocs.meta.tombstone_key_check.canary, app._tombstone.canary());
+
+  fsCommits.length = 0;
+  const writesBefore = fsSetsBefore();
+  await app._tombstone.ensureCanary();
+  assert.equal(fsSetsBefore(), writesBefore, 'a matching canary is not rewritten');
+});
+
+test('migration never shortens an existing retention date', async () => {
+  const { migrateLegacyTombstones } = require('../tools/migrate_tombstones');
+  const fp = fingerprint('both@example.com');
+  const newer = '2026-06-01T00:00:00.000Z';
+  const older = '2025-01-01T00:00:00.000Z';
+  // The fingerprint exists because this account deleted again after the new
+  // build; the legacy document carries its older deletion. Seeding the merge
+  // map from existing documents is what keeps the newer date.
+  fsDocs.deletedAccounts = {
+    [fp]: { deleted_at: newer },
+    'both@example.com': { deleted_at: older },
+  };
+
+  const res = await migrateLegacyTombstones({
+    db: firestoreStub.getDb(),
+    fingerprint,
+    apply: true,
+  });
+
+  assert.equal(res.merged, 1);
+  assert.equal(fsDocs.deletedAccounts[fp].deleted_at, newer);
+});
+
+function fsSetsBefore() {
+  return fsSets.length;
+}
+
 test('migration dry run writes nothing', async () => {
   const { migrateLegacyTombstones } = require('../tools/migrate_tombstones');
   fsDocs.deletedAccounts = { 'dry@example.com': { deleted_at: new Date().toISOString() } };
