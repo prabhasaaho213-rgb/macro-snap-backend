@@ -45,8 +45,40 @@ const firestoreStub = {
         set: async () => true,
         delete: async () => true,
       }),
-      where: () => ({ get: async () => ({ empty: true, docs: [] }) }),
+      // Only the deletedAccounts range query is used: `where('deleted_at','<',cutoff)`
+      // for the retention purge. Refuse other fields loudly rather than
+      // returning an empty result that would hide a broken purge.
+      where: (field, op, value) => ({
+        get: async () => {
+          if (field !== 'deleted_at' || op !== '<') {
+            throw new Error('unexpected where: ' + field + ' ' + op);
+          }
+          const col = fsDocs[name] || {};
+          const docs = Object.keys(col)
+            .filter((id) => (col[id] || {}).deleted_at < value)
+            .map((id) => ({ id, ref: { collection: name, id }, data: () => col[id] }));
+          return { empty: docs.length === 0, docs };
+        },
+      }),
     }),
+    batch: () => {
+      const pending = [];
+      return {
+        delete: (ref) => {
+          pending.push(ref);
+          return {
+            delete: () => pending.push(ref),
+          };
+        },
+        commit: async () => {
+          for (const ref of pending) {
+            if (fsDocs[ref.collection]) delete fsDocs[ref.collection][ref.id];
+          }
+          pending.length = 0;
+          return true;
+        },
+      };
+    },
   }),
 };
 
@@ -154,6 +186,32 @@ test('deleting an account writes only a fingerprint, and drops the old raw doc',
     false,
     'the stored record must not contain the address'
   );
+});
+
+test('expired fingerprints are purged, whether or not Postgres is configured', async () => {
+  // Production runs Firestore-only (no DATABASE_URL), so the SQL purge at the
+  // end of the delete handler never fires there. This is the half that keeps
+  // the policy's "deleted automatically after 24 months" true in that setup.
+  const expired = 'a'.repeat(64);
+  const recent = 'b'.repeat(64);
+  const fresh = 'c'.repeat(64);
+  fsDocs.deletedAccounts = {
+    [expired]: { deleted_at: '2020-01-01T00:00:00.000Z' },
+    [recent]: { deleted_at: new Date().toISOString() },
+  };
+
+  await deleteAccount(
+    makeReq({ uid: 'uid_purge', email: 'purge@example.com', email_verified: true }),
+    makeRes()
+  );
+
+  assert.deepEqual(
+    Object.keys(fsDocs.deletedAccounts).sort(),
+    [recent, fingerprint('purge@example.com')].sort(),
+    'the expired fingerprint goes, recent ones stay'
+  );
+  assert.equal(fsDocs.deletedAccounts[expired], undefined);
+  assert.ok(fsDocs.deletedAccounts[fresh] === undefined, 'unrelated ids untouched');
 });
 
 test('a deleted account is not offered the ₹1 month again', async () => {

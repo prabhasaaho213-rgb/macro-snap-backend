@@ -2513,6 +2513,27 @@ app.post('/account/delete', requireAuth, async (req, res) => {
           'deletedAccounts/' + String(identifier).toLowerCase()
         );
       } catch (_) {}
+      // Storage limitation, Firestore half. This matters more than the SQL copy
+      // below: production runs without DATABASE_URL (the startup log says
+      // "running without Postgres"), so the SQL purge never executes there and
+      // the policy's "deleted automatically after 24 months" would be a promise
+      // no code keeps. Expired fingerprints are removed here, on the next
+      // deletion, whichever store the deployment actually uses.
+      try {
+        const db = firestore.getDb();
+        const cutoff = new Date(
+          Date.now() - TOMBSTONE_RETENTION_MONTHS * 30.44 * 24 * 3600 * 1000
+        ).toISOString();
+        const snap = await db
+          .collection('deletedAccounts')
+          .where('deleted_at', '<', cutoff)
+          .get();
+        if (snap && snap.docs && snap.docs.length > 0) {
+          const batch = db.batch();
+          snap.docs.forEach((d) => batch.delete(d.ref));
+          await batch.commit();
+        }
+      } catch (_) {}
     }
     if (dbAvailable) {
       try {
