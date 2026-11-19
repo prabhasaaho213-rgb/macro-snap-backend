@@ -411,11 +411,12 @@ async function initDB(retries = 5) {
             created_at TIMESTAMPTZ DEFAULT NOW()
           );
         `);
-        // Deleted-account tombstone: remembers an account's identifier
-        // (phone/email) and its PRE-REMOVAL trial metadata AFTER the account
-        // is deleted. The free trial no longer exists, so the tombstone is
-        // passive now — it is still written so a future pricing experiment
-        // can never be farmed by delete -> re-register loops. Never wiped.
+        // Deleted-account tombstone: an HMAC fingerprint of the account's
+        // identifier plus its PRE-REMOVAL trial metadata, written when the
+        // account is deleted. phone/email are legacy columns left over from
+        // the cleartext version and are no longer written; the identifier
+        // column now holds the fingerprint. Rows expire after
+        // TOMBSTONE_RETENTION_MONTHS, so this is not kept forever.
         await client.query(`
           CREATE TABLE IF NOT EXISTS deleted_accounts (
             identifier TEXT PRIMARY KEY,
@@ -559,13 +560,65 @@ const FIRST_MONTH_PRICE = 100; // ₹1 in paise
 //   * intro_used was recorded on a previous successful charge, or
 //   * any payment record exists for the identifier (accounts that paid
 //     before this flag existed — the flag is only written from this release
-//     on, and a legacy payer must not be handed ₹1 again).
+//     on, and a legacy payer must not be handed ₹1 again), or
+//   * a deletion tombstone exists for it — the payment records are wiped by
+//     /account/delete, so for a deleted account this is the only evidence.
 //
 // Fail-open: when the stores cannot be read, the intro price is offered
 // rather than withheld — wrongly charging a first-timer ₹49 at checkout
 // (after the app already showed them ₹1) is the worse mismatch, and the
 // abuse costs at most one ₹1 month per incident.
+
+// ── Deletion tombstone: a fingerprint, never an address ─────────────
+// The tombstone has exactly one purpose (see /account/delete): stop the ₹1
+// first month being collected twice by deleting and re-registering. Keeping an
+// email address for that is both unnecessary and the most sensitive thing in
+// the database — an identifier retained with no expiry is precisely what an
+// erasure request targets.
+//
+// It was also never read by any code path, so the record enforced nothing while
+// being stored forever. Both halves are fixed here: what is stored is an HMAC
+// of the normalised identifier, keyed with a server secret, so the same input
+// always matches and nothing can be read back out of it; and rows older than
+// TOMBSTONE_RETENTION_MONTHS are deleted, so the record has a defined lifetime
+// instead of "indefinitely".
+const TOMBSTONE_RETENTION_MONTHS = 24;
+const TOMBSTONE_SECRET =
+  process.env.TOMBSTONE_SECRET ||
+  process.env.RAZORPAY_KEY_SECRET ||
+  'macrosnap-deletion-fingerprint-v1';
+
+function tombstoneFingerprint(identifier) {
+  return crypto
+    .createHmac('sha256', TOMBSTONE_SECRET)
+    .update(String(identifier).trim().toLowerCase())
+    .digest('hex');
+}
+
 async function introUsedFor({ uid, identifier }) {
+  // Checked first, and deliberately: every other record of a payment is wiped
+  // by /account/delete, so for a deleted account this is the only thing that
+  // still remembers the ₹1 was taken.
+  if (identifier) {
+    const fp = tombstoneFingerprint(identifier);
+    if (firestore.isEnabled()) {
+      try {
+        const d = await firestore
+          .getDb()
+          .collection('deletedAccounts')
+          .doc(fp)
+          .get();
+        if (d.exists) return true;
+      } catch (_) {}
+    }
+    if (dbAvailable) {
+      const t = await dbq(
+        'SELECT 1 FROM deleted_accounts WHERE identifier = $1 LIMIT 1',
+        [fp]
+      );
+      if (t.rows[0]) return true;
+    }
+  }
   if (uid && firestore.isEnabled()) {
     try {
       const doc = await firestore.getDb().collection('users').doc(uid).get();
@@ -2419,12 +2472,12 @@ app.get('/trial/status', requireAuth, async (req, res) => {
 
 // In-app self-service account deletion.
 //
-// Wipes ALL of the user's data (Postgres + Firestore) but keeps a tombstone
-// that remembers the identifier (phone/email) AND the original trial start.
-// That tombstone is what prevents a delete -> re-login -> fresh free-trial
-// that remembers the identifier (phone/email) — never wiped.
-// The free trial no longer exists, so the tombstone's trial fields only
-// matter as historical bookkeeping; nothing re-grants off them.
+// Wipes ALL of the user's data (Postgres + Firestore) and keeps exactly one
+// thing: a tombstone holding an HMAC fingerprint of the identifier and the
+// deletion timestamp. It exists so the once-per-account ₹1 first month cannot
+// be collected again by deleting and re-registering — see tombstoneFingerprint
+// for why the record is a keyed hash rather than the email, and
+// TOMBSTONE_RETENTION_MONTHS for how long it lives.
 app.post('/account/delete', requireAuth, async (req, res) => {
   try {
     // You can only delete the account you are signed in as.
@@ -2435,44 +2488,45 @@ app.post('/account/delete', requireAuth, async (req, res) => {
     if (!identifier) return res.status(400).json({ error: 'Identity required' });
     if (isAdminUser(id)) return res.status(403).json({ error: 'Admin account cannot be deleted' });
 
-    // 1) Capture the original trial start BEFORE wiping anything.
-    let trialStartedAt = null;
+    // 1) Resolve the uid before anything is wiped: it is the key for the
+    //    Firestore documents removed in step 4.
+    //
+    //    Nothing about the old free trial is captured any more. The trial is
+    //    gone, nothing reads its marker, and "when this person started a trial
+    //    that no longer exists" is not something worth remembering about a
+    //    deleted account.
     const fUid = await firestore.resolveUid(identifier);
-    if (fUid && firestore.isEnabled()) {
-      try {
-        const doc = await firestore.getDb().collection('users').doc(fUid).get();
-        trialStartedAt = doc.exists ? (doc.data().trial_started_at || null) : null;
-      } catch (_) {}
-    }
-    if (!trialStartedAt && dbAvailable) {
-      try {
-        const r = await dbq('SELECT trial_started_at FROM users WHERE phone = $1 OR email = $1 LIMIT 1', [identifier]);
-        trialStartedAt = (r.rows[0] && r.rows[0].trial_started_at) || null;
-      } catch (_) {}
-    }
 
-    // 2) Write the tombstone — remember the mail/phone so the free trial can
-    //    never be claimed again by this identity. This is NEVER deleted.
+    // 2) Write the tombstone. It holds NO email, phone or name — only an HMAC
+    //    fingerprint of the identifier, which is enough to answer "has this
+    //    identity spent the ₹1 month?" and useless for anything else. See
+    //    tombstoneFingerprint() for why, and for the retention window.
+    const fingerprint = tombstoneFingerprint(identifier);
     if (firestore.isEnabled()) {
-      await firestore.set('deletedAccounts/' + String(identifier).toLowerCase(), {
-        identifier,
-        phone: phone || null,
-        email: email || null,
-        trial_started_at: trialStartedAt,
+      await firestore.set('deletedAccounts/' + fingerprint, {
         deleted_at: new Date().toISOString(),
       });
+      // Remove the old raw-identifier document written by earlier builds: it
+      // carries the email in cleartext and nothing reads that id any more.
+      try {
+        await firestore.del(
+          'deletedAccounts/' + String(identifier).toLowerCase()
+        );
+      } catch (_) {}
     }
     if (dbAvailable) {
       try {
         await dbq(
-          `INSERT INTO deleted_accounts (identifier, phone, email, trial_started_at)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (identifier) DO UPDATE SET
-             phone = COALESCE(EXCLUDED.phone, deleted_accounts.phone),
-             email = COALESCE(EXCLUDED.email, deleted_accounts.email),
-             trial_started_at = COALESCE(deleted_accounts.trial_started_at, EXCLUDED.trial_started_at),
-             deleted_at = NOW()`,
-          [identifier, phone || null, email || null, trialStartedAt]
+          `INSERT INTO deleted_accounts (identifier) VALUES ($1)
+           ON CONFLICT (identifier) DO UPDATE SET deleted_at = NOW()`,
+          [fingerprint]
+        );
+        // Storage limitation, enforced by the write that creates the rows:
+        // fingerprints older than the retention window go on the next deletion.
+        await dbq(
+          `DELETE FROM deleted_accounts
+           WHERE deleted_at < NOW() - ($1 || ' months')::interval`,
+          [String(TOMBSTONE_RETENTION_MONTHS)]
         );
       } catch (_) {}
     }
@@ -2497,7 +2551,7 @@ app.post('/account/delete', requireAuth, async (req, res) => {
     }
 
     // 4) Wipe personal data — Firestore (best-effort). users/{uid} goes too:
-    //    its trial marker now lives on in the tombstone.
+    //    it carries the profile, and the tombstone does not need it.
     if (fUid && firestore.isEnabled()) {
       const db = firestore.getDb();
       for (const col of ['habitData', 'dietProfiles', 'recentFoods', 'userPreferences']) {
@@ -2524,7 +2578,7 @@ app.post('/account/delete', requireAuth, async (req, res) => {
       await firestore.del('users/' + fUid);
     }
 
-    res.json({ ok: true, trialPreserved: !!trialStartedAt });
+    res.json({ ok: true });
   } catch (e) {
     return sendFailure(req, res, e);
   }
@@ -2796,6 +2850,14 @@ if (require.main === module) {
 
 module.exports = app;
 module.exports._rateLimits = RATE_WINDOWS;
+// Test hook: the deletion tombstone's fingerprint and retention window. The
+// retained record must not be a readable identifier, and that is worth a test
+// rather than a comment (test/tombstone.test.js).
+module.exports._tombstone = {
+  fingerprint: tombstoneFingerprint,
+  retentionMonths: TOMBSTONE_RETENTION_MONTHS,
+  introUsedFor,
+};
 // Test hook: the pure AI-output sanitizers. They are the only thing standing
 // between a hallucinated "250 kcal" and a result card that throws, so they are
 // unit-tested directly (test/scan_output.test.js).

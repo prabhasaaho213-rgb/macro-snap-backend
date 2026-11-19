@@ -240,8 +240,14 @@ test('trial: delete -> re-register gets NO fresh trial', async () => {
   assert.equal(del.statusCode, 200);
   assert.equal(del.payload.ok, true, 'deletion must succeed');
   assert.ok(
-    fsDocs.deletedAccounts && fsDocs.deletedAccounts['9999999999'],
-    'a tombstone must remember the identifier'
+    fsDocs.deletedAccounts &&
+      fsDocs.deletedAccounts[app._tombstone.fingerprint('9999999999')],
+    'a tombstone must exist, keyed by the identifier fingerprint'
+  );
+  assert.equal(
+    fsDocs.deletedAccounts['9999999999'],
+    undefined,
+    'the identifier itself must never be a document id'
   );
 
   // "Re-register": users/{uid} is gone (the fake del() really deletes),
@@ -254,17 +260,30 @@ test('trial: delete -> re-register gets NO fresh trial', async () => {
   assert.equal(freshGrants.length, 0, 'no fresh trial_started_at may ever be written');
 });
 
-test('trial: delete remembers the old trial in the tombstone but it stays dead', async () => {
+test('trial: the tombstone keeps no trial marker and no identifier', async () => {
   const startedAt = new Date(Date.now() - 10 * DAY).toISOString();
   fsDocs.users = { uid2: { trial_started_at: startedAt } };
 
   const del = makeRes();
   await accountDelete(makeReq({ phone: '9999999999' }), del);
-  assert.equal(del.payload.trialPreserved, true, 'historical trial start is still captured');
+  assert.equal(del.statusCode, 200);
+
+  const doc = fsDocs.deletedAccounts[app._tombstone.fingerprint('9999999999')];
+  assert.ok(doc, 'the tombstone exists, keyed by fingerprint');
+  assert.deepEqual(
+    Object.keys(doc),
+    ['deleted_at'],
+    'nothing but the deletion time is stored about a deleted account'
+  );
   assert.equal(
-    fsDocs.deletedAccounts['9999999999'].trial_started_at,
-    startedAt,
-    'the tombstone still records it for historical bookkeeping'
+    doc.trial_started_at,
+    undefined,
+    'a trial that no longer exists is not worth remembering forever'
+  );
+  assert.equal(
+    JSON.stringify(fsDocs.deletedAccounts).includes('9999999999'),
+    false,
+    'the deleted identifier must not appear anywhere in the tombstone store'
   );
 
   const res = makeRes();
