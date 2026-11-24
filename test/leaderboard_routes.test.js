@@ -213,7 +213,9 @@ test('sync scores meals, habits and water from Firestore, not the client', async
       name: 'Asha',
       stateKey: 'maharashtra',
       districtKey: 'pune',
-      days: [{ dateKey: today, steps: 12000, stepGoal: 10000, weighIn: true }],
+      // 5,000 steps is one movement award (10). Kept at the smallest unit so
+      // the total does not depend on the time of day `stepCeiling()` sees.
+      days: [{ dateKey: today, steps: 5000, weighIn: true }],
     }),
     res
   );
@@ -222,8 +224,8 @@ test('sync scores meals, habits and water from Firestore, not the client', async
   assert.equal(res.body.ok, true);
   assert.match(res.body.week, /^\d{4}-W\d{2}$/);
 
-  // Meals 30 + habits 15 + water 10 + steps 20 + weigh-in 5 = 80.
-  assert.equal(res.body.points, 80);
+  // Meals 30 + habits 15 + water 10 + steps 10 + weigh-in 5 = 70.
+  assert.equal(res.body.points, 70);
   assert.deepEqual(res.body.scopes, [
     'india',
     'state_maharashtra',
@@ -237,7 +239,7 @@ test('sync scores meals, habits and water from Firestore, not the client', async
       `leaderboard/${res.body.week}/scopes/${scope}/entries/uid1`
     );
     assert.ok(entry, `missing entry for ${scope}`);
-    assert.equal(entry.points, 80);
+    assert.equal(entry.points, 70);
     assert.equal(entry.name, 'Asha');
     assert.equal(entry.uid, 'uid1');
   }
@@ -346,7 +348,98 @@ test('leave removes every entry for this week', async () => {
     store.get(`leaderboard/${week}/scopes/india/entries/uid1`),
     undefined
   );
-  assert.equal(store.get('leaderboardMeta/uid1'), undefined);
+  // The meta document STAYS: it is the only server-side memory that this
+  // account joined, and a reinstall has to be able to tell "left" from
+  // "never joined" (otherwise it asks a joined user to join again).
+  const meta = store.get('leaderboardMeta/uid1');
+  assert.ok(meta);
+  assert.equal(meta.joined, false);
+  assert.equal(meta.stateKey, 'maharashtra');
+});
+
+test('step history is stored server-side and survives a client that sends none', async () => {
+  const today = lb.todayKey();
+  store.set('habitData/uid1', { habits: [], waterLog: {}, waterGoal: 8 });
+
+  const first = makeRes();
+  await routes.post['/leaderboard/sync'](
+    makeReq({
+      name: 'Asha',
+      stateKey: 'maharashtra',
+      districtKey: 'pune',
+      days: [{ dateKey: today, steps: 5000 }],
+    }),
+    first
+  );
+  assert.equal(first.statusCode, 200);
+  assert.equal(first.body.stepDays[today], 5000);
+
+  // A second sync that reports no steps (fresh install, late start) must keep
+  // the stored total instead of zeroing the day's movement points.
+  const second = makeRes();
+  await routes.post['/leaderboard/sync'](
+    makeReq({
+      name: 'Asha',
+      stateKey: 'maharashtra',
+      districtKey: 'pune',
+      days: [],
+    }),
+    second
+  );
+  assert.equal(second.statusCode, 200);
+  const todayEntry = second.body.dayPoints.find((d) => d.dateKey === today);
+  assert.equal(todayEntry.buckets.movement, 10);
+  assert.equal(store.get('stepLog/uid1').days[today], 5000);
+});
+
+test('a lower step count never takes points back', async () => {
+  const today = lb.todayKey();
+  // 6,000 is under the earliest possible ceiling (6,000 + 2,000/hour), so this
+  // assertion does not depend on the time of day the suite runs.
+  store.set('stepLog/uid1', { days: { [today]: 6000 } });
+
+  const res = makeRes();
+  await routes.post['/leaderboard/sync'](
+    makeReq({
+      stateKey: 'maharashtra',
+      districtKey: 'pune',
+      days: [{ dateKey: today, steps: 5000 }],
+    }),
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  const todayEntry = res.body.dayPoints.find((d) => d.dateKey === today);
+  assert.equal(todayEntry.buckets.movement, 10);
+  assert.equal(store.get('stepLog/uid1').days[today], 6000);
+});
+
+test('GET /leaderboard/me restores a join and the step history', async () => {
+  const today = lb.todayKey();
+  store.set('leaderboardMeta/uid1', {
+    week: lb.isoWeek().week,
+    stateKey: 'maharashtra',
+    districtKey: 'pune',
+    name: 'Asha',
+    joined: true,
+  });
+  store.set('stepLog/uid1', { days: { [today]: 9000 } });
+
+  const res = makeRes();
+  await routes.get['/leaderboard/me'](makeReq({}), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.joined, true);
+  assert.equal(res.body.stateKey, 'maharashtra');
+  assert.equal(res.body.districtKey, 'pune');
+  assert.equal(res.body.stepDays[today], 9000);
+});
+
+test('GET /leaderboard/me reports a fresh account as not joined', async () => {
+  const res = makeRes();
+  await routes.get['/leaderboard/me'](makeReq({}), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.joined, false);
+  assert.deepEqual(res.body.stepDays, {});
 });
 
 test('the cleanup cron fails closed without the secret', async () => {

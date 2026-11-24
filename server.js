@@ -2139,6 +2139,55 @@ async function readWeighInDays(db, uid) {
   return days;
 }
 
+// Steps are the one activity the server has to REMEMBER on its own: the phone's
+// own step sensor counts them, and no other stored document knows them. Keeping
+// the day totals here is what makes yesterday's movement points survive a
+// reinstall, a new phone, or a day the app was never opened — the board is
+// recomputed from this log plus Firestore (meals, habits, water, weigh-ins).
+const STEP_LOG = 'stepLog';
+const STEP_LOG_DAYS = 60;
+
+function normalizeDayMap(value) {
+  const out = {};
+  if (!value || typeof value !== 'object') return out;
+  for (const [key, raw] of Object.entries(value)) {
+    const day = String(key).slice(0, 10);
+    const steps = Number(raw);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+    if (!Number.isFinite(steps) || steps <= 0) continue;
+    out[day] = Math.min(Math.max(0, Math.trunc(steps)), 200000);
+  }
+  return out;
+}
+
+async function readStepDays(db, uid) {
+  try {
+    const doc = await db.collection(STEP_LOG).doc(uid).get();
+    return normalizeDayMap(doc.exists ? (doc.data() || {}).days : null);
+  } catch (e) {
+    console.error(
+      '[leaderboard] step log read failed:',
+      e && e.message ? e.message : e
+    );
+    return {};
+  }
+}
+
+// The whole map is rewritten (not merged field by field) so old days are
+// pruned in the same write; `firestore.set` does not merge.
+async function writeStepDays(db, uid, days) {
+  const kept = {};
+  for (const key of Object.keys(days).sort().slice(-STEP_LOG_DAYS)) {
+    kept[key] = days[key];
+  }
+  const ok = await firestore.set(STEP_LOG + '/' + uid, {
+    days: kept,
+    updatedAt: new Date(),
+  });
+  if (!ok) console.error('[leaderboard] step log write failed for', uid);
+  return ok;
+}
+
 function habitsCompletedOn(habitData, key) {
   const list =
     habitData && Array.isArray(habitData.habits) ? habitData.habits : [];
@@ -2243,12 +2292,14 @@ app.post(
       }
 
       // ── Server-side truth ───────────────────────────────────────────────
-      const [meals, habits, profile, weighIns] = await Promise.all([
+      const [meals, habits, profile, weighIns, storedSteps] = await Promise.all([
         readMealDays(db, uid),
         readHabitDay(db, uid),
         readDietProfile(db, uid),
         readWeighInDays(db, uid),
+        readStepDays(db, uid),
       ]);
+      const stepLog = { ...storedSteps };
       const calorieTarget = lb.dietTargetCalories(profile);
       const habitData = habits.ok ? habits.data : null;
       const waterGoal = lb.clampInt(habitData && habitData.waterGoal, 0, 5000);
@@ -2280,15 +2331,18 @@ app.post(
               ? client.goal
               : body.stepGoal
         );
+        void stepGoal; // Scoring no longer depends on a chosen target.
         const ceiling = key === today ? lb.stepCeiling() : 200000;
-        const steps = Math.min(
-          lb.clampInt(
-            client.steps !== undefined ? client.steps : client.stepCount,
-            0,
-            200000
-          ),
-          ceiling
+        const claimed = lb.clampInt(
+          client.steps !== undefined ? client.steps : client.stepCount,
+          0,
+          200000
         );
+        // Keep the HIGHEST figure seen for the day. The sensor only counts up,
+        // so a later sync reporting fewer steps (a reboot, a reinstall, a
+        // client that started late) must not walk yesterday's points back.
+        const steps = Math.min(Math.max(claimed, stepLog[key] || 0), ceiling);
+        if (steps > 0) stepLog[key] = steps;
         const weighedIn =
           weighIns.has(key) ||
           client.weighIn === true ||
@@ -2337,6 +2391,10 @@ app.post(
           .filter((n) => typeof n === 'string');
         name = lb.uniqueName(name, uid, taken);
       } catch (_) {}
+
+      // Persist the merged step history BEFORE the board write: a board that
+      // survives without its steps would score zero tomorrow.
+      await writeStepDays(db, uid, stepLog);
 
       // ── Write the three boards ─────────────────────────────────────────
       const batch = db.batch();
@@ -2402,6 +2460,7 @@ app.post(
         districtKey: finalDistrict,
         moves,
         name,
+        joined: true,
         updatedAt: new Date(),
       });
       if (!metaSet) {
@@ -2419,6 +2478,7 @@ app.post(
           .filter((d) => d.dateKey === today)
           .reduce((sum, d) => sum + d.points, 0),
         dayPoints,
+        stepDays: stepLog,
         name,
         stateKey: finalState,
         districtKey: finalDistrict,
@@ -2429,6 +2489,68 @@ app.post(
     }
   }
 );
+
+// ─── Restore this account's leaderboard state ──────────────────────────────
+// Join state, area and step history used to live ONLY in the phone's
+// SharedPreferences, so uninstalling the app (or signing in on a new phone)
+// lost all three: the page asked a joined user to join again, and yesterday's
+// movement points vanished because the step totals that produced them were
+// gone. This route is the restore path for a fresh install.
+app.get('/leaderboard/me', requireAuth, async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const uid = id.uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'leaderboard_unavailable' });
+    }
+    const db = firestore.getDb();
+    const week = lb.isoWeek();
+    const today = lb.todayKey();
+
+    const meta = await firestore.get(LEADERBOARD_META + '/' + uid);
+    const name = meta && typeof meta.name === 'string' ? meta.name : '';
+    const state = meta ? lb.stateKey(meta.stateKey) : null;
+    const district = meta ? lb.slug(meta.districtKey || '') : '';
+
+    let joined = !!(meta && meta.joined === true);
+    // Meta documents written by the OLD sync had no `joined` field, and that
+    // sync only ever wrote one for an account that had joined. Absence of the
+    // flag is therefore a join, not a leave (a leave deleted the document).
+    if (meta && typeof meta.joined === 'undefined' && state && district) {
+      joined = true;
+    }
+    if (!joined && state && district) {
+      // Legacy rows (written before `joined` existed) still count as joined
+      // while this week's entry is on the India board.
+      try {
+        const entry = await db
+          .collection('leaderboard')
+          .doc(week.week)
+          .collection('scopes')
+          .doc('india')
+          .collection('entries')
+          .doc(uid)
+          .get();
+        joined = entry.exists;
+      } catch (_) {}
+    }
+
+    res.json({
+      ok: true,
+      joined,
+      name,
+      stateKey: state,
+      districtKey: district,
+      week: week.week,
+      weekId: week.week,
+      today,
+      stepDays: await readStepDays(db, uid),
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
 
 app.post('/leaderboard/leave', requireAuth, async (req, res) => {
   try {
@@ -2458,8 +2580,18 @@ app.post('/leaderboard/leave', requireAuth, async (req, res) => {
       );
       return res.status(503).json({ error: 'leaderboard_unavailable' });
     }
-    await firestore.del(LEADERBOARD_META + '/' + uid);
-    res.json({ ok: true });
+    // Keep the meta document, marked as left. Deleting it (what this used to
+    // do) threw away the only server-side memory of the join, so a reinstall
+    // could not tell "never joined" from "joined and left" and asked the user
+    // to join again with an account that was already on the board.
+    const meta = await firestore.get(LEADERBOARD_META + '/' + uid);
+    await firestore.set(LEADERBOARD_META + '/' + uid, {
+      ...(meta || {}),
+      joined: false,
+      week,
+      updatedAt: new Date(),
+    });
+    res.json({ ok: true, joined: false });
   } catch (e) {
     return sendFailure(req, res, e);
   }

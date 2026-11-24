@@ -6,15 +6,17 @@ const assert = require('node:assert/strict');
 const lb = require('../leaderboard');
 
 test('the daily table matches the app exactly', () => {
-  assert.equal(lb.DAILY_MAX, 90);
-  assert.equal(lb.WEEK_MAX, 630);
+  assert.equal(lb.DAILY_MAX, 170);
+  assert.equal(lb.WEEK_MAX, 1190);
   assert.equal(lb.POINTS.meal, 10);
   assert.equal(lb.POINTS.habit, 5);
-  assert.equal(lb.POINTS.stepGoal, 20);
+  assert.equal(lb.POINTS.stepsPerAward, 5000);
+  assert.equal(lb.POINTS.stepAward, 10);
+  assert.equal(lb.POINTS.movementDailyCap, 100);
   assert.equal(lb.POINTS.weighIn, 5);
 });
 
-test('a full day is worth 90 and never more', () => {
+test('a full day is worth 170 and never more', () => {
   const day = lb.scoreDay({
     mealCount: 3,
     calorieGoalMet: true,
@@ -25,12 +27,13 @@ test('a full day is worth 90 and never more', () => {
     stepGoal: 10000,
     weighedIn: true,
   });
-  assert.equal(day.points, 90);
+  assert.equal(day.points, 110);
   assert.deepEqual(day.buckets, {
     nutrition: 40,
     habits: 15,
     hydration: 10,
-    movement: 20,
+    // 20,000 steps = four complete 5,000s = 4 × 10.
+    movement: 40,
     body: 5,
   });
 });
@@ -46,20 +49,24 @@ test('absurd client facts are clamped to the table', () => {
     weighedIn: true,
     calorieGoalMet: true,
   });
-  assert.equal(day.points, 90);
+  assert.equal(day.points, lb.DAILY_MAX);
 });
 
-test('steps only pay when the goal is reached, and the goal is snapped', () => {
+test('movement pays 10 for every complete 5,000 steps', () => {
+  // Below one unit nothing is paid; each full 5,000 is another 10.
+  assert.equal(lb.scoreDay({ steps: 4999 }).buckets.movement, 0);
+  assert.equal(lb.scoreDay({ steps: 5000 }).buckets.movement, 10);
+  assert.equal(lb.scoreDay({ steps: 9999 }).buckets.movement, 10);
+  assert.equal(lb.scoreDay({ steps: 10000 }).buckets.movement, 20);
+  assert.equal(lb.scoreDay({ steps: 25000 }).buckets.movement, 50);
+  // The chosen step target no longer changes the payout.
   assert.equal(
-    lb.scoreDay({ steps: 9999, stepGoal: 10000 }).buckets.movement,
-    0
+    lb.scoreDay({ steps: 5000, stepGoal: 50000 }).buckets.movement,
+    10
   );
-  assert.equal(
-    lb.scoreDay({ steps: 10000, stepGoal: 10000 }).buckets.movement,
-    20
-  );
-  // A goal outside the offered range is replaced by the default, never
-  // lowered to make the 20-point award free.
+  // A corrupt count is capped at the movement ceiling (50,000 steps).
+  assert.equal(lb.scoreDay({ steps: 200000 }).buckets.movement, 100);
+  // A goal outside the offered range is replaced by the default.
   assert.equal(lb.normalizeStepGoal(1), 10000);
   assert.equal(lb.normalizeStepGoal(2500), 5000);
   assert.equal(lb.normalizeStepGoal(70000), 10000);

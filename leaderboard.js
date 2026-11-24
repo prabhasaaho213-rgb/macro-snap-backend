@@ -11,11 +11,15 @@
 //   * meals, habits, water — read from Firestore by the caller (the `meals`
 //     and `habitData` documents the app already mirrors), so the client cannot
 //     invent a count it did not log.
-//   * steps, weigh-in, calorie goal — not stored server-side anywhere, so the
-//     client asserts them. Each is worth a fixed, small number of points and is
+//   * weigh-in, calorie goal — not stored server-side anywhere, so the client
+//     asserts them. Each is worth a fixed, small number of points and is
 //     hard-capped here, which is the difference that matters: the worst a
 //     tampered client can do is claim the same maximum a real user earns in
-//     those buckets (20 + 5 + 10 a day), not an arbitrary week total.
+//     those buckets (5 + 10 a day), not an arbitrary week total.
+//   * steps — persisted server-side in `stepLog/{uid}` by the sync route, so a
+//     reinstall or a day the app was not opened still counts. The phone's step
+//     sensor (not Health Connect) is the primary source, and the route keeps
+//     the HIGHER of what it stored and what the client reports.
 //
 // The table mirrors lib/services/leaderboard_service.dart exactly. If one side
 // changes, the other must too — test/leaderboard.test.js pins the numbers.
@@ -35,8 +39,14 @@ const POINTS = {
   waterGoalBonus: 5,
   hydrationDailyCap: 10,
 
-  stepGoal: 20,
-  stepGoalDailyCap: 20,
+  // Movement pays PER DISTANCE WALKED, not for crossing one target: every
+  // 5,000 steps is 10 points. A user who walks 20,000 steps earns 40, the
+  // same rate for everyone, and nothing is gated behind a goal they can
+  // change. The cap (50,000 steps' worth) only exists so a corrupt or
+  // tampered count cannot print an unbounded week total.
+  stepsPerAward: 5000,
+  stepAward: 10,
+  movementDailyCap: 100,
 
   weighIn: 5,
 
@@ -45,10 +55,10 @@ const POINTS = {
   nutritionDailyCap: 40,
 };
 
-// Meals (30) + habits (15) + hydration (10) + steps (20) + weigh-in (5) + the
-// calorie goal (10).
-const DAILY_MAX = 90;
-const WEEK_MAX = DAILY_MAX * 7; // 630
+// Meals (30) + habits (15) + hydration (10) + movement (100) + weigh-in (5) +
+// the calorie goal (10).
+const DAILY_MAX = 170;
+const WEEK_MAX = DAILY_MAX * 7; // 1190
 
 // The states/UT keys the app offers (lib/services/leaderboard_remote.dart).
 // The key is part of the Firestore path, so it must be a known value rather
@@ -278,7 +288,6 @@ function scoreDay(facts) {
   const glasses = clampInt(f.waterGlasses, 0, 100);
   const waterGoal = clampInt(f.waterGoal, 0, 5000);
   const steps = clampInt(f.steps, 0, MAX_DAILY_STEP_INPUT);
-  const stepGoal = normalizeStepGoal(f.stepGoal);
 
   const nutrition = Math.min(
     meals * POINTS.meal + (f.calorieGoalMet === true ? POINTS.calorieGoal : 0),
@@ -290,7 +299,11 @@ function scoreDay(facts) {
       (waterGoal > 0 && glasses >= waterGoal ? POINTS.waterGoalBonus : 0),
     POINTS.hydrationDailyCap
   );
-  const movement = steps >= stepGoal ? POINTS.stepGoal : 0;
+  // 10 points for every complete 5,000 steps (0 for fewer than 5,000).
+  const movement = Math.min(
+    Math.floor(steps / POINTS.stepsPerAward) * POINTS.stepAward,
+    POINTS.movementDailyCap
+  );
   const body = f.weighedIn === true ? POINTS.weighIn : 0;
 
   const buckets = {
