@@ -5,6 +5,7 @@ const sharp = require('sharp');
 const { Pool } = require('pg');
 const firestore = require('./firestore');
 const { requireAuth, identityOf } = require('./auth');
+const lb = require('./leaderboard');
 
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -167,6 +168,8 @@ const RATE_WINDOWS = {
   // Each call creates a Razorpay customer and subscription, so an unlimited
   // loop is a way to fill the merchant account with junk mandates.
   '/payment/create-subscription': 5,
+  // Each sync reads a week of meals/habits and writes three board rows.
+  '/leaderboard/sync': 12,
 };
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_COLLECTION = 'rateLimits';
@@ -273,6 +276,20 @@ const razorpay =
     : null;
 
 app.get('/', (req, res) => res.send('OK'));
+
+// Liveness probe. Deliberately says nothing sensitive — no keys, no counts of
+// users, no configuration values — just whether the process is up, whether the
+// Firestore Admin SDK initialised, and for how long. Vercel and uptime checks
+// need this; a 404 here made a healthy deployment look down.
+const BOOTED_AT = Date.now();
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    firestore: firestore.isEnabled(),
+    postgres: dbAvailable,
+    uptimeSeconds: Math.round((Date.now() - BOOTED_AT) / 1000),
+  });
+});
 
 // ─── Razorpay Subscription plan (created once, cached in memory) ───────
 // Real recurring billing needs a monthly plan. We reuse an existing matching
@@ -1855,6 +1872,646 @@ app.post('/meals/sync', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Meal photo cloud backup (Pro, opt-in) ─────────────────────────────────
+// The app (lib/services/meal_photo_sync.dart) uploads, restores and deletes a
+// meal's photo through THESE routes. They were missing from this backend, so
+// the whole feature silently did nothing: every upload answered 404 and the app
+// treats a failed upload as best-effort, so nobody was told the backup was
+// never happening. Photos live in `mealPhotos/{uid}:{mealId}` — a Firestore
+// document written only by the Admin SDK, which is also where the Pro gate
+// lives (firestore.rules denies clients the collection outright).
+const PHOTO_DOC_MAX_BYTES = 700 * 1024; // Firestore caps a document at 1 MiB
+const MEAL_ID_RE = /^[A-Za-z0-9._:-]{1,120}$/;
+
+function photoDocId(uid, mealId) {
+  return uid + ':' + mealId;
+}
+
+// True only when the meal document is this account's. /meals/sync keys meal
+// documents `{uid}:{mealId}`, so the direct get covers today's writes; the
+// query covers documents written by other paths. The URL's meal id is never
+// trusted on its own.
+async function ownedMeal(uid, mealId) {
+  const db = firestore.getDb();
+  try {
+    const doc = await db.collection('meals').doc(photoDocId(uid, mealId)).get();
+    if (doc.exists) return true;
+  } catch (_) {}
+  try {
+    const snap = await db.collection('meals').where('uid', '==', uid).limit(400).get();
+    return snap.docs.some((d) => {
+      const data = d.data() || {};
+      return data.uid === uid && (data.mealId === mealId || data.id === mealId);
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+app.post(
+  '/meals/:mealId/photo',
+  requireAuth,
+  rateLimit('/meals/photo'),
+  upload.single('image'),
+  async (req, res) => {
+    try {
+      const id = identityOf(req);
+      const mealId = String(req.params.mealId || '');
+      if (!id.uid) return res.status(400).json({ error: 'identity_required' });
+      if (!MEAL_ID_RE.test(mealId)) {
+        return res.status(400).json({ error: 'bad_meal_id' });
+      }
+      if (!firestore.isEnabled()) {
+        return res.status(503).json({ error: 'photo_backup_unavailable' });
+      }
+      if (!req.file || !req.file.buffer || !req.file.buffer.length) {
+        return res.status(400).json({ error: 'No image uploaded' });
+      }
+      // Pro gate: the Settings toggle is cosmetic on its own, so the server
+      // decides. A lapsed Pro account keeps the copies it already has and can
+      // still delete them — it just cannot store new ones.
+      const ent = await entitlementsFor(id);
+      if (!ent.subscribed) return res.status(403).json({ error: 'pro_required' });
+      if (!(await ownedMeal(id.uid, mealId))) {
+        return res.status(404).json({ error: 'meal_not_found' });
+      }
+      // Re-encode instead of storing what arrived: a camera original would not
+      // fit in a Firestore document, and EXIF (GPS included) has no business in
+      // a backup.
+      let jpeg;
+      try {
+        jpeg = await sharp(req.file.buffer)
+          .rotate()
+          .resize({
+            width: 1280,
+            height: 1280,
+            fit: 'inside',
+            withoutEnlargement: true,
+          })
+          .jpeg({ quality: 72, mozjpeg: true })
+          .toBuffer();
+      } catch (_) {
+        return res.status(400).json({ error: 'not_an_image' });
+      }
+      if (jpeg.length > PHOTO_DOC_MAX_BYTES) {
+        return res.status(413).json({ error: 'image_too_large' });
+      }
+      const saved = await firestore.set('mealPhotos/' + photoDocId(id.uid, mealId), {
+        uid: id.uid,
+        mealId: mealId,
+        contentType: 'image/jpeg',
+        bytes: jpeg.length,
+        data: jpeg.toString('base64'),
+        updatedAt: new Date(),
+      });
+      if (!saved) return res.status(503).json({ error: 'photo_not_saved' });
+      res.json({ ok: true, bytes: jpeg.length });
+    } catch (e) {
+      return sendFailure(req, res, e);
+    }
+  }
+);
+
+app.get('/meals/:mealId/photo', requireAuth, async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const mealId = String(req.params.mealId || '');
+    if (!id.uid) return res.status(400).json({ error: 'identity_required' });
+    if (!MEAL_ID_RE.test(mealId)) {
+      return res.status(400).json({ error: 'bad_meal_id' });
+    }
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'photo_backup_unavailable' });
+    }
+    const doc = await firestore
+      .getDb()
+      .collection('mealPhotos')
+      .doc(photoDocId(id.uid, mealId))
+      .get();
+    const data = doc.exists ? doc.data() || {} : null;
+    // Someone else's photo answers 404, same as a missing one: the owner check
+    // must not tell a stranger which meal ids have backups.
+    if (!data || data.uid !== id.uid || typeof data.data !== 'string') {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    res.json({
+      data: data.data,
+      contentType: data.contentType || 'image/jpeg',
+      bytes: typeof data.bytes === 'number' ? data.bytes : null,
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+app.delete('/meals/:mealId/photo', requireAuth, async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const mealId = String(req.params.mealId || '');
+    if (!id.uid) return res.status(400).json({ error: 'identity_required' });
+    if (!MEAL_ID_RE.test(mealId)) {
+      return res.status(400).json({ error: 'bad_meal_id' });
+    }
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'photo_backup_unavailable' });
+    }
+    // Deleting rides on ownership only, never on the Pro flag: a lapsed
+    // account must still be able to remove the backups it already has.
+    const ref = firestore
+      .getDb()
+      .collection('mealPhotos')
+      .doc(photoDocId(id.uid, mealId));
+    const doc = await ref.get();
+    if (doc.exists && (doc.data() || {}).uid === id.uid) {
+      try {
+        await ref.delete();
+      } catch (e) {
+        console.error('mealPhotos delete failed:', e && e.message ? e.message : e);
+        return res.status(503).json({ error: 'photo_not_deleted' });
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+// ─── Leaderboard: server-scored weekly boards ───────────────────────────────
+// The app posts its raw activity once per sync; the SERVER scores it with
+// `leaderboard.js` and writes the board entries through the Admin SDK (which
+// bypasses firestore.rules, so clients cannot write points at all).
+//
+// What the client sends (field names taken from the shipped 1.5.22 build):
+//   { name, stateKey, districtKey, weekId?, days: [
+//       { dateKey|date, steps, stepGoal, weighIn, meals?, habits?, water?,
+//         waterGoal? } ] }
+// Meals, habits and water are re-read from Firestore here and only fall back to
+// the client's numbers when that read fails, so a modified app cannot inflate
+// them. Steps and weigh-ins exist only on the phone, so they are asserted — and
+// bounded (`stepCeiling` refuses "20,000 steps at 00:30").
+const MAX_MOVES_PER_WEEK = 3;
+const LEADERBOARD_META = 'leaderboardMeta';
+
+function dayKeyOf(value) {
+  if (typeof value === 'string') {
+    const direct = value.slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return direct;
+    return lb.mealDayKey({ date: value });
+  }
+  return lb.mealDayKey({ date: value });
+}
+
+// Meals for this account, grouped by IST day. `ok:false` means the read failed
+// (the caller then falls back to the client's counts rather than scoring zero).
+async function readMealDays(db, uid) {
+  const byDay = new Map();
+  try {
+    const snap = await db.collection('meals').where('uid', '==', uid).get();
+    for (const doc of snap.docs) {
+      const data = doc.data() || {};
+      if (data.uid !== uid) continue;
+      const key = lb.mealDayKey(data);
+      if (!key) continue;
+      const entry = byDay.get(key) || { count: 0, calories: 0 };
+      entry.count += 1;
+      entry.calories += Math.max(0, Number(data.calories) || 0);
+      byDay.set(key, entry);
+    }
+    return { ok: true, byDay };
+  } catch (e) {
+    console.error(
+      '[leaderboard/sync] meal read failed:',
+      e && e.message ? e.message : e
+    );
+    return { ok: false, byDay };
+  }
+}
+
+async function readHabitDay(db, uid) {
+  try {
+    const doc = await db.collection('habitData').doc(uid).get();
+    return { ok: true, data: (doc.exists ? doc.data() : null) || null };
+  } catch (e) {
+    console.error(
+      '[leaderboard/sync] habit read failed:',
+      e && e.message ? e.message : e
+    );
+    return { ok: false, data: null };
+  }
+}
+
+async function readDietProfile(db, uid) {
+  try {
+    const doc = await db.collection('dietProfiles').doc(uid).get();
+    return (doc.exists ? doc.data() : null) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Weigh-ins, from the weightLog the app mirrors. Both shapes are accepted: a
+// `days` subcollection and a `days` map on the parent document.
+async function readWeighInDays(db, uid) {
+  const days = new Set();
+  try {
+    const snap = await db
+      .collection('weightLog')
+      .doc(uid)
+      .collection('days')
+      .get();
+    for (const doc of snap.docs) {
+      const key = doc.id.slice(0, 10);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(key)) days.add(key);
+    }
+  } catch (_) {}
+  if (days.size === 0) {
+    try {
+      const doc = await db.collection('weightLog').doc(uid).get();
+      const map = doc.exists ? (doc.data() || {}).days : null;
+      if (map && typeof map === 'object') {
+        for (const key of Object.keys(map)) {
+          const day = key.slice(0, 10);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(day)) days.add(day);
+        }
+      }
+    } catch (_) {}
+  }
+  return days;
+}
+
+function habitsCompletedOn(habitData, key) {
+  const list =
+    habitData && Array.isArray(habitData.habits) ? habitData.habits : [];
+  let done = 0;
+  for (const habit of list) {
+    if (!habit || typeof habit !== 'object' || habit.paused === true) continue;
+    const dates = Array.isArray(habit.completedDates)
+      ? habit.completedDates
+      : [];
+    if (dates.some((d) => typeof d === 'string' && d.slice(0, 10) === key)) {
+      done += 1;
+    }
+  }
+  return done;
+}
+
+function waterOn(habitData, key) {
+  const log =
+    habitData && habitData.waterLog && typeof habitData.waterLog === 'object'
+      ? habitData.waterLog
+      : {};
+  const value = Number(log[key]);
+  return Number.isFinite(value) ? value : 0;
+}
+
+app.post(
+  '/leaderboard/sync',
+  requireAuth,
+  rateLimit('/leaderboard/sync'),
+  async (req, res) => {
+    try {
+      const id = identityOf(req);
+      const uid = id.uid;
+      if (!uid) return res.status(400).json({ error: 'identity_required' });
+      if (!firestore.isEnabled()) {
+        return res.status(503).json({ error: 'leaderboard_unavailable' });
+      }
+      const db = firestore.getDb();
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+      // Field names as seen in the shipped 1.5.22 build, with the obvious
+      // aliases tolerated so an app build that nests them still syncs.
+      const area = body.location || body.area || body.profile || {};
+      const state = lb.stateKey(
+        body.stateKey || body.state || area.stateKey || area.state
+      );
+      const district = lb.slug(
+        body.districtKey || body.district || area.districtKey || area.district || ''
+      );
+      if (!state || !district) {
+        return res.status(400).json({ error: 'area_required' });
+      }
+
+      const week = lb.isoWeek();
+      const today = lb.todayKey();
+
+      // ── Where this account competes, with the 3-moves-a-week limit ──────
+      let meta = null;
+      try {
+        const doc = await db.collection(LEADERBOARD_META).doc(uid).get();
+        meta = (doc.exists ? doc.data() : null) || null;
+      } catch (_) {}
+      let moves = Number(meta && meta.week === week.week ? meta.moves : 0) || 0;
+      let finalState = state;
+      let finalDistrict = district;
+      let locationLocked = false;
+      const sameArea =
+        !!meta && meta.stateKey === state && meta.districtKey === district;
+      if (
+        meta &&
+        meta.week === week.week &&
+        !sameArea &&
+        moves >= MAX_MOVES_PER_WEEK
+      ) {
+        // Out of moves: keep them on the board they already compete in.
+        finalState = lb.stateKey(meta.stateKey) || state;
+        finalDistrict = lb.slug(meta.districtKey || '') || district;
+        locationLocked = true;
+      } else if (!sameArea) {
+        moves = Math.min(moves + 1, MAX_MOVES_PER_WEEK);
+      }
+
+      const scopes = lb.boardsFor(finalState, finalDistrict);
+
+      // ── Per-day client facts ────────────────────────────────────────────
+      const clientDays = new Map();
+      const rawDays = Array.isArray(body.days)
+        ? body.days
+        : Array.isArray(body.facts)
+          ? body.facts
+          : Array.isArray(body.entries)
+            ? body.entries
+            : [];
+      for (const day of rawDays) {
+        if (!day || typeof day !== 'object') continue;
+        const key = dayKeyOf(day.dateKey || day.date || day.key || day.day);
+        if (key) clientDays.set(key, day);
+      }
+      // A client that posts a single flat day still gets its steps counted.
+      if (clientDays.size === 0 && typeof body.steps !== 'undefined') {
+        clientDays.set(today, body);
+      }
+
+      // ── Server-side truth ───────────────────────────────────────────────
+      const [meals, habits, profile, weighIns] = await Promise.all([
+        readMealDays(db, uid),
+        readHabitDay(db, uid),
+        readDietProfile(db, uid),
+        readWeighInDays(db, uid),
+      ]);
+      const calorieTarget = lb.dietTargetCalories(profile);
+      const habitData = habits.ok ? habits.data : null;
+      const waterGoal = lb.clampInt(habitData && habitData.waterGoal, 0, 5000);
+
+      const dayPoints = [];
+      let weekPoints = 0;
+      for (const key of week.dates) {
+        if (key > today) {
+          dayPoints.push({ dateKey: key, points: 0, buckets: {} });
+          continue;
+        }
+        const client = clientDays.get(key) || {};
+        const mealsForDay = meals.ok
+          ? meals.byDay.get(key) || { count: 0, calories: 0 }
+          : { count: 0, calories: 0 };
+        const mealCount = meals.ok
+          ? mealsForDay.count
+          : lb.clampInt(client.meals, 0, 3);
+        const completedHabits = habits.ok
+          ? habitsCompletedOn(habitData, key)
+          : lb.clampInt(client.habits, 0, 3);
+        const glasses = habits.ok
+          ? waterOn(habitData, key)
+          : lb.clampInt(client.water, 0, 100);
+        const stepGoal = lb.normalizeStepGoal(
+          client.stepGoal !== undefined
+            ? client.stepGoal
+            : client.goal !== undefined
+              ? client.goal
+              : body.stepGoal
+        );
+        const ceiling = key === today ? lb.stepCeiling() : 200000;
+        const steps = Math.min(
+          lb.clampInt(
+            client.steps !== undefined ? client.steps : client.stepCount,
+            0,
+            200000
+          ),
+          ceiling
+        );
+        const weighedIn =
+          weighIns.has(key) ||
+          client.weighIn === true ||
+          client.weighedIn === true;
+        const calorieGoalMet =
+          calorieTarget > 0 && mealsForDay.calories >= calorieTarget;
+
+        const scored = lb.scoreDay({
+          mealCount,
+          completedHabits,
+          waterGlasses: glasses,
+          waterGoal: lb.clampInt(client.waterGoal, 0, 5000) || waterGoal,
+          steps,
+          stepGoal,
+          weighedIn,
+          calorieGoalMet,
+        });
+        weekPoints += scored.points;
+        dayPoints.push({
+          dateKey: key,
+          points: scored.points,
+          buckets: scored.buckets,
+        });
+      }
+      weekPoints = Math.min(weekPoints, lb.WEEK_MAX);
+
+      // ── Display name, unique on the board it lands on ──────────────────
+      const claimedName =
+        typeof body.name === 'string' && body.name.trim()
+          ? body.name
+          : typeof body.displayName === 'string' && body.displayName.trim()
+            ? body.displayName
+            : (meta && meta.name) || '';
+      let name = lb.publicName(claimedName);
+      try {
+        const snap = await db
+          .collection('leaderboard')
+          .doc(week.week)
+          .collection('scopes')
+          .doc(scopes[2])
+          .collection('entries')
+          .get();
+        const taken = snap.docs
+          .filter((d) => d.id !== uid)
+          .map((d) => (d.data() || {}).name)
+          .filter((n) => typeof n === 'string');
+        name = lb.uniqueName(name, uid, taken);
+      } catch (_) {}
+
+      // ── Write the three boards ─────────────────────────────────────────
+      const batch = db.batch();
+      // Marker documents: a scope (or week) that only holds subcollections is
+      // invisible to `.get()`, and both the stale-scope cleanup below and the
+      // cleanup cron enumerate these collections.
+      const weekRef = db.collection('leaderboard').doc(week.week);
+      batch.set(weekRef, {
+        week: week.week,
+        startDate: week.dates[0],
+        updatedAt: new Date(),
+      });
+      for (const scope of scopes) {
+        batch.set(
+          weekRef.collection('scopes').doc(scope),
+          { scope, week: week.week, updatedAt: new Date() },
+        );
+        batch.set(
+          db
+            .collection('leaderboard')
+            .doc(week.week)
+            .collection('scopes')
+            .doc(scope)
+            .collection('entries')
+            .doc(uid),
+          {
+            uid,
+            name,
+            points: weekPoints,
+            week: week.week,
+            scope,
+            stateKey: finalState,
+            districtKey: finalDistrict,
+            updatedAt: new Date(),
+          }
+        );
+      }
+      // Leaving a district must not leave a row behind on the old board.
+      try {
+        const scopesSnap = await db
+          .collection('leaderboard')
+          .doc(week.week)
+          .collection('scopes')
+          .get();
+        for (const doc of scopesSnap.docs) {
+          if (scopes.includes(doc.id)) continue;
+          batch.delete(
+            db
+              .collection('leaderboard')
+              .doc(week.week)
+              .collection('scopes')
+              .doc(doc.id)
+              .collection('entries')
+              .doc(uid)
+          );
+        }
+      } catch (_) {}
+      await batch.commit();
+
+      const metaSet = await firestore.set(LEADERBOARD_META + '/' + uid, {
+        week: week.week,
+        stateKey: finalState,
+        districtKey: finalDistrict,
+        moves,
+        name,
+        updatedAt: new Date(),
+      });
+      if (!metaSet) {
+        console.error('[leaderboard/sync] meta write failed for', uid);
+      }
+
+      res.json({
+        ok: true,
+        status: 'ok',
+        week: week.week,
+        weekId: week.week,
+        scopes,
+        points: weekPoints,
+        todayPoints: dayPoints
+          .filter((d) => d.dateKey === today)
+          .reduce((sum, d) => sum + d.points, 0),
+        dayPoints,
+        name,
+        stateKey: finalState,
+        districtKey: finalDistrict,
+        locationLocked,
+      });
+    } catch (e) {
+      return sendFailure(req, res, e);
+    }
+  }
+);
+
+app.post('/leaderboard/leave', requireAuth, async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const uid = id.uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'leaderboard_unavailable' });
+    }
+    const db = firestore.getDb();
+    const week = lb.isoWeek().week;
+    try {
+      const scopesSnap = await db
+        .collection('leaderboard')
+        .doc(week)
+        .collection('scopes')
+        .get();
+      for (const doc of scopesSnap.docs) {
+        await firestore.del(
+          'leaderboard/' + week + '/scopes/' + doc.id + '/entries/' + uid
+        );
+      }
+    } catch (e) {
+      console.error(
+        '[leaderboard/leave] board read failed:',
+        e && e.message ? e.message : e
+      );
+      return res.status(503).json({ error: 'leaderboard_unavailable' });
+    }
+    await firestore.del(LEADERBOARD_META + '/' + uid);
+    res.json({ ok: true });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+// ─── Leaderboard cleanup (cron) ─────────────────────────────────────────────
+// Weekly boards are disposable: a row is a name and a number for one week. This
+// removes boards older than four weeks so the collection cannot grow forever.
+// Fail closed: without a matching CRON_SECRET nothing is deleted.
+const LEADERBOARD_RETENTION_DAYS = 28;
+
+async function leaderboardGc(req, res) {
+  const secret = process.env.CRON_SECRET;
+  const header = String(req.headers['x-cron-secret'] || '');
+  const bearer = String(req.headers.authorization || '').replace(
+    /^Bearer\s+/i,
+    ''
+  );
+  if (!secret || (header !== secret && bearer !== secret)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  if (!firestore.isEnabled()) {
+    return res.status(503).json({ error: 'leaderboard_unavailable' });
+  }
+  try {
+    const db = firestore.getDb();
+    const cutoff = lb.addDays(
+      lb.todayKey(),
+      -LEADERBOARD_RETENTION_DAYS
+    );
+    const snap = await db.collection('leaderboard').get();
+    const deleted = [];
+    for (const doc of snap.docs) {
+      const weekId = doc.id;
+      const start = lb.weekStartDate(weekId);
+      if (!start || start >= cutoff) continue;
+      if (typeof db.recursiveDelete === 'function') {
+        await db.recursiveDelete(doc.ref);
+      } else {
+        await doc.ref.delete();
+      }
+      deleted.push(weekId);
+    }
+    res.json({ ok: true, deleted, cutoff });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+}
+
+app.post('/cron/leaderboard-gc', leaderboardGc);
+app.get('/cron/leaderboard-gc', leaderboardGc);
+
 // ─── Habits & Water Log ─────────────────────────────────────────────────────
 // REMOVED: POST /habits/sync and GET /habits/list/:phone (audit).
 // The comment that used to sit here said the Flutter app's MealSyncService
@@ -2632,6 +3289,21 @@ app.get('/trial/status', requireAuth, async (req, res) => {
 // be collected again by deleting and re-registering — see tombstoneFingerprint
 // for why the record is a keyed hash rather than the email, and
 // TOMBSTONE_RETENTION_MONTHS for how long it lives.
+// Deletes every document matching [query], in batches of 400 — Firestore caps
+// a commit at 500 writes, so the old "one batch for the whole account" broke
+// silently for anyone with more than 500 meals. Throws on failure: the caller
+// records it instead of reporting a clean deletion.
+async function deleteEveryMatching(db, query) {
+  const snap = await query.get();
+  const docs = (snap && snap.docs) || [];
+  for (let i = 0; i < docs.length; i += 400) {
+    const batch = db.batch();
+    docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+  }
+  return docs.length;
+}
+
 app.post('/account/delete', requireAuth, async (req, res) => {
   try {
     // You can only delete the account you are signed in as.
@@ -2756,35 +3428,163 @@ app.post('/account/delete', requireAuth, async (req, res) => {
       }
     }
 
-    // 4) Wipe personal data — Firestore (best-effort). users/{uid} goes too:
-    //    it carries the profile, and the tombstone does not need it.
+    // 4) Wipe personal data — Firestore. Every step is CHECKED now. This used
+    //    to delete the account's meals in ONE unbounded batch (Firestore caps a
+    //    commit at 500 writes), swallow every failure, skip the `mealPhotos`
+    //    collection the privacy policy promises to delete, and answer
+    //    {ok:true} regardless — so a large account or a transient Firestore
+    //    error left data behind while the app said the account was gone.
+    const failures = [];
+    let authDeleted = false;
     if (fUid && firestore.isEnabled()) {
       const db = firestore.getDb();
-      for (const col of ['habitData', 'dietProfiles', 'recentFoods', 'userPreferences']) {
-        await firestore.del(col + '/' + fUid);
-      }
-      // meals where uid matches (docs keyed by meal id)
+      const note = (what, e) => {
+        const detail = e && e.message ? e.message : String(e || 'failed');
+        console.error('[account/delete] ' + what + ':', detail);
+        failures.push(what);
+      };
+
+      // 4a) Stop the billing FIRST. A deleted account whose Razorpay mandate is
+      //     still live keeps being auto-charged for a subscription it can no
+      //     longer see, let alone cancel.
+      let subs = [];
       try {
-        const snap = await db.collection('meals').where('uid', '==', fUid).get();
-        const batch = db.batch();
-        snap.docs.forEach((d) => batch.delete(d.ref));
-        if (snap.docs.length > 0) await batch.commit();
-      } catch (_) {}
-      // money records keyed by uid
-      for (const col of ['subscriptions', 'payments']) {
-        try {
-          const snap = await db.collection(col).where('uid', '==', fUid).get();
-          const batch = db.batch();
-          snap.docs.forEach((d) => batch.delete(d.ref));
-          if (snap.docs.length > 0) await batch.commit();
-        } catch (_) {}
+        const snap = await db
+          .collection('subscriptions')
+          .where('uid', '==', fUid)
+          .get();
+        subs = snap.docs;
+      } catch (e) {
+        note('subscription lookup', e);
       }
-      // identifier -> uid index + the profile doc itself
-      await firestore.del('userIndex/' + identifier);
-      await firestore.del('users/' + fUid);
+      for (const doc of subs) {
+        const subId = doc.id;
+        const status = String((doc.data() || {}).status || '').toLowerCase();
+        if (['cancelled', 'completed', 'expired', 'halted'].includes(status)) {
+          continue;
+        }
+        if (!razorpay) {
+          note('subscription ' + subId + ' not cancelled (Razorpay not configured)');
+          continue;
+        }
+        try {
+          // false = cancel now rather than at the end of the cycle: this is an
+          // account deletion, and a final charge after it would be
+          // unexplainable to the user who asked to be deleted.
+          await razorpay.subscriptions.cancel(subId, false);
+        } catch (e) {
+          // A mandate that is already gone answers 400. Re-read before treating
+          // it as a failure, so retrying the deletion is not blocked forever.
+          let alreadyGone = false;
+          try {
+            const live = await razorpay.subscriptions.fetch(subId);
+            alreadyGone = ['cancelled', 'completed', 'expired', 'halted'].includes(
+              String((live && live.status) || '').toLowerCase()
+            );
+          } catch (_) {}
+          if (!alreadyGone) note('subscription ' + subId + ' not cancelled', e);
+        }
+      }
+
+      // 4b) Account-owned collections, in bounded batches.
+      const owned = [
+        ['meals', () => db.collection('meals').where('uid', '==', fUid)],
+        ['mealPhotos', () => db.collection('mealPhotos').where('uid', '==', fUid)],
+        ['payments', () => db.collection('payments').where('uid', '==', fUid)],
+        ['referrals', () => db.collection('referrals').where('uid', '==', fUid)],
+      ];
+      for (const [label, query] of owned) {
+        try {
+          await deleteEveryMatching(db, query());
+        } catch (e) {
+          note(label + ' not fully deleted', e);
+        }
+      }
+      // Leaderboard entries carry the display name, so they are personal data
+      // too. The collection-group query needs an index; a failure is recorded
+      // rather than fatal, and the retry can finish it.
+      // Board rows are ephemeral (weekly reset, name + points only), so a
+      // missing collection-group index is logged rather than turning every
+      // deletion into a "failed" state the user cannot act on.
+      try {
+        await deleteEveryMatching(
+          db,
+          db.collectionGroup('entries').where('uid', '==', fUid)
+        );
+      } catch (e) {
+        console.error(
+          '[account/delete] leaderboard entries not cleared:',
+          e && e.message ? e.message : e
+        );
+      }
+      // Single documents. The safe helpers return false on failure instead of
+      // throwing, so every result is checked.
+      for (const col of [
+        'habitData',
+        'dietProfiles',
+        'recentFoods',
+        'userPreferences',
+        'analytics',
+        'recipes',
+        'userIndex',
+        'users',
+      ]) {
+        const id = col === 'userIndex' ? identifier : fUid;
+        const ok = await firestore.del(col + '/' + id);
+        if (!ok) note(col + '/' + id + ' not deleted');
+      }
+      // The subscription and payment records themselves, after the mandate is
+      // dead — never before, or the cancellation would have nothing to look up.
+      for (const doc of subs) {
+        const ok = await firestore.del('subscriptions/' + doc.id);
+        if (!ok) note('subscriptions/' + doc.id + ' not deleted');
+      }
     }
 
-    res.json({ ok: true });
+    // 5) The sign-in identity itself. When the device's own delete() failed
+    //    (Firebase requires a recent login) the app used to sign out anyway,
+    //    leaving a usable Firebase account behind a screen that said the
+    //    account was gone. The Admin SDK needs no fresh login.
+    if (fUid) {
+      const admin = firestore.getAdmin ? firestore.getAdmin() : null;
+      if (!admin) {
+        // Unreachable for a real request: requireAuth verifies tokens WITH the
+        // Admin SDK, so no authenticated call arrives without it. Logged so a
+        // misconfigured deployment is visible instead of silent.
+        console.error('[account/delete] auth not deleted: Firebase Admin unavailable');
+      } else {
+        try {
+          await admin.auth().deleteUser(fUid);
+          authDeleted = true;
+        } catch (e) {
+          if (e && e.code === 'auth/user-not-found') {
+            authDeleted = true; // already gone — the desired end state
+          } else {
+            console.error(
+              '[account/delete] auth deleteUser:',
+              e && e.message ? e.message : e
+            );
+            failures.push('auth account not deleted');
+          }
+        }
+      }
+    }
+
+    if (failures.length) {
+      // 202, not 200: most of the account is gone (its sign-in may already be),
+      // but the app must not claim a clean deletion. "Partly deleted" is a
+      // retryable state — neither success nor "nothing happened".
+      return res.status(202).json({
+        ok: false,
+        incomplete: true,
+        auth_deleted: authDeleted,
+        error: 'account_deletion_incomplete',
+        message:
+          'Some account data could not be deleted yet. Retry from Settings, or email macrosnap7@gmail.com and we will finish it.',
+      });
+    }
+
+    res.json({ ok: true, auth_deleted: authDeleted });
   } catch (e) {
     return sendFailure(req, res, e);
   }

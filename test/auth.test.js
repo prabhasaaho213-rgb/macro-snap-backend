@@ -52,6 +52,10 @@ const firestoreStub = {
         get: async () => ({ empty: true, docs: [] }),
       }),
     }),
+    collectionGroup: () => ({
+      where: () => ({ get: async () => ({ empty: true, docs: [] }) }),
+    }),
+    batch: () => ({ delete: () => {}, commit: async () => {} }),
     // Single-doc transaction, matching how /analyze and shared rate limits
     // read -> decide -> write against the same in-memory doc.
     runTransaction: async (fn) => {
@@ -94,7 +98,12 @@ const adminStub = {
 
 // ── express / multer / pg / sharp / dotenv fakes ────────────────────────
 // The chain is captured in full so the middleware is actually executed.
-const routes = { get: {}, post: {}, chains: { get: {}, post: {} } };
+const routes = {
+  get: {},
+  post: {},
+  delete: {},
+  chains: { get: {}, post: {}, delete: {} },
+};
 const appStub = {
   use: () => {},
   get: (p, ...fns) => {
@@ -104,6 +113,10 @@ const appStub = {
   post: (p, ...fns) => {
     routes.post[p] = fns[fns.length - 1];
     routes.chains.post[p] = fns;
+  },
+  delete: (p, ...fns) => {
+    routes.delete[p] = fns[fns.length - 1];
+    routes.chains.delete[p] = fns;
   },
   listen: () => {},
 };
@@ -120,7 +133,14 @@ function multer() {
 }
 multer.memoryStorage = () => ({});
 const pgStub = { Pool: class { query() { return { rows: [] }; } } };
-const sharpStub = (buf) => ({ jpeg: () => ({ toBuffer: async () => buf }) });
+const sharpStub = (buf) => {
+  const chain = {
+    rotate: () => chain,
+    resize: () => chain,
+    jpeg: () => ({ toBuffer: async () => buf }),
+  };
+  return chain;
+};
 
 const origLoad = Module._load;
 Module._load = function (request) {

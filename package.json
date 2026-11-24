@@ -6,7 +6,8 @@
     "start": "node server.js",
     "build": "npm install",
     "backfill": "node backfill_firestore.js",
-    "test": "node --test"
+    "test": "node --test test/*.test.js",
+    "test:rules": "firebase emulators:exec --only firestore --project demo-macrosnap \"node --test test/rules\""
   },
   "engines": {
     "node": ">=18.0.0"

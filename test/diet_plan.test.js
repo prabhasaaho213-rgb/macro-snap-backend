@@ -10,11 +10,14 @@ const assert = require('node:assert/strict');
 const Module = require('node:module');
 
 // ── express / multer / pg / sharp / dotenv fakes ────────────────────────
-const routes = { get: {}, post: {} };
+const routes = { get: {}, post: {}, delete: {} };
 const appStub = {
   use: () => {},
   get: (p, ...fns) => { routes.get[p] = fns[fns.length - 1]; },
   post: (p, ...fns) => { routes.post[p] = fns[fns.length - 1]; },
+  // DELETE routes are captured too: the meal-photo backup is deleted
+  // with a DELETE request, and a stub without it cannot load server.js.
+  delete: (p, ...fns) => { routes.delete[p] = fns[fns.length - 1]; },
   listen: () => {},
 };
 function express() { return appStub; }
@@ -23,7 +26,14 @@ express.static = () => () => {};
 function multer() { return { single: () => (req, res, next) => next() }; }
 multer.memoryStorage = () => ({});
 const pgStub = { Pool: class { query() { return { rows: [] }; } } };
-const sharpStub = (buf) => ({ jpeg: () => ({ toBuffer: async () => buf }) });
+const sharpStub = (buf) => {
+  const chain = {
+    rotate: () => chain,
+    resize: () => chain,
+    jpeg: () => ({ toBuffer: async () => buf }),
+  };
+  return chain;
+};
 // /generate-diet-plan is Pro-only, so the harness has to be able to produce a
 // SUBSCRIBED user. entitlementsFor reads Firestore users/{uid}.subscribed, so
 // the stub reports exactly that for the uids in `subscribedUids` (and an empty

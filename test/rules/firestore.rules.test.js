@@ -22,10 +22,22 @@ const {
   assertSucceeds,
 } = require('@firebase/rules-unit-testing');
 
-const RULES = fs.readFileSync(
-  path.join(__dirname, '..', '..', 'app', 'firestore.rules'),
-  'utf8'
-);
+// The canonical rules live with the app. These tests were written for the
+// monorepo layout (`backend/../app`) but the backend is also published as its
+// own repo, where that path does not exist — so resolve the first candidate
+// that is actually there instead of failing at require time.
+const RULES_PATH = [
+  path.join(__dirname, '..', '..', 'app', 'firestore.rules'), // monorepo
+  path.join(__dirname, '..', '..', '..', 'firestore.rules'), // work/ root copy
+  path.join(__dirname, '..', '..', 'firestore.rules'), // backend repo copy
+].find((p) => fs.existsSync(p));
+if (!RULES_PATH) {
+  throw new Error(
+    'firestore.rules not found — looked in the monorepo, the work/ root and '
+      'the backend repo'
+  );
+}
+const RULES = fs.readFileSync(RULES_PATH, 'utf8');
 
 let env;
 

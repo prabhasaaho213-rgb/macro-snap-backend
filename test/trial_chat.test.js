@@ -40,7 +40,14 @@ const firestoreStub = {
         _col: name,
         _id: id,
       }),
+      // Query + batch support for /account/delete, which deletes every
+      // account-owned collection in batches of 400.
+      where: () => ({ get: async () => ({ empty: true, docs: [] }) }),
     }),
+    collectionGroup: () => ({
+      where: () => ({ get: async () => ({ empty: true, docs: [] }) }),
+    }),
+    batch: () => ({ delete: () => {}, commit: async () => {} }),
     // Single-doc transaction, matching how /analyze reserves a scan.
     runTransaction: async (fn) => {
       if (failSharedTransactions) throw new Error('shared store unavailable');
@@ -61,7 +68,12 @@ const firestoreStub = {
 };
 
 // ── express / multer / pg / sharp / dotenv fakes ────────────────────────
-const routes = { get: {}, post: {}, chains: { get: {}, post: {} } };
+const routes = {
+  get: {},
+  post: {},
+  delete: {},
+  chains: { get: {}, post: {}, delete: {} },
+};
 const appStub = {
   use: () => {},
   get: (p, ...fns) => {
@@ -72,6 +84,10 @@ const appStub = {
     routes.post[p] = fns[fns.length - 1];
     routes.chains.post[p] = fns;
   },
+  delete: (p, ...fns) => {
+    routes.delete[p] = fns[fns.length - 1];
+    routes.chains.delete[p] = fns;
+  },
   listen: () => {},
 };
 function express() { return appStub; }
@@ -80,7 +96,14 @@ express.static = () => () => {};
 function multer() { return { single: () => (req, res, next) => next() }; }
 multer.memoryStorage = () => ({});
 const pgStub = { Pool: class { query() { return { rows: [] }; } } };
-const sharpStub = (buf) => ({ jpeg: () => ({ toBuffer: async () => buf }) });
+const sharpStub = (buf) => {
+  const chain = {
+    rotate: () => chain,
+    resize: () => chain,
+    jpeg: () => ({ toBuffer: async () => buf }),
+  };
+  return chain;
+};
 
 const origLoad = Module._load;
 Module._load = function (request, parent, isMain) {
