@@ -170,6 +170,11 @@ const RATE_WINDOWS = {
   '/payment/create-subscription': 5,
   // Each sync reads a week of meals/habits and writes three board rows.
   '/leaderboard/sync': 12,
+  // Account-scoped step history. The app pushes after a step batch (throttled
+  // to a few a minute), so this only has to stop a runaway loop.
+  '/steps/sync': 20,
+  // A rename happens a handful of times in an account's life.
+  '/user/profile': 10,
 };
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_COLLECTION = 'rateLimits';
@@ -1576,6 +1581,59 @@ app.get('/user/profile', requireAuth, async (req, res) => {
   }
 });
 
+// Saves a renamed profile to the ACCOUNT.
+//
+// GET /user/profile above is what a fresh install calls to restore the name,
+// and it reads `userIndex` — which only /register ever wrote. A rename never
+// reached it, so uninstalling and signing in again fetched the registration
+// name and visibly undid the rename. This writes every copy the restore path
+// and the boards read, so the name follows the account, not the device.
+app.post('/user/profile', requireAuth, rateLimit('/user/profile'), async (req, res) => {
+  try {
+    const raw = (req.body || {}).name;
+    const safeName = typeof raw === 'string' ? raw.trim().slice(0, 40) : '';
+    if (!safeName) return res.status(400).json({ error: 'name_required' });
+
+    const id = identityOf(req);
+    const identifier = id.identifier;
+    if (!identifier) return res.status(400).json({ error: 'Identity required' });
+
+    // Postgres is the non-Firestore deployment's store; best-effort here so a
+    // DB-less host still saves the Firestore copies below.
+    try {
+      await dbq(
+        'INSERT INTO users (phone, name) VALUES ($1, $2) ON CONFLICT (phone) DO UPDATE SET name = $2',
+        [identifier, safeName]
+      );
+    } catch (e) {
+      console.warn('name save (postgres) failed:', e && e.message);
+    }
+
+    const fUid = await firestore.resolveUid(identifier);
+    if (fUid && firestore.isEnabled()) {
+      await firestore.set(
+        'userIndex/' + identifier,
+        { uid: fUid, name: safeName },
+        { merge: true }
+      );
+      await firestore.set('users/' + fUid, { name: safeName }, { merge: true });
+      // A member's leaderboard row carries its own copy of the name. Update it
+      // in place, but never create meta for an account that never joined.
+      const meta = await firestore.get(LEADERBOARD_META + '/' + fUid);
+      if (meta) {
+        await firestore.set(
+          LEADERBOARD_META + '/' + fUid,
+          { name: safeName, updatedAt: new Date() },
+          { merge: true }
+        );
+      }
+    }
+    res.json({ name: safeName });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
 function generateReferralCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -2187,6 +2245,55 @@ async function writeStepDays(db, uid, days) {
   if (!ok) console.error('[leaderboard] step log write failed for', uid);
   return ok;
 }
+
+// ── Account-scoped step history ──────────────────────────────────────────
+//
+// Steps used to reach the server only through /leaderboard/sync, which rejects
+// an account that has not joined a board (`area_required`). So a non-member's
+// walking lived on one phone only and a reinstall destroyed it. These two
+// routes store the per-day totals against the verified account instead, which
+// is what makes "delete and reinstall, sign in, steps are back" true — with or
+// without Health Connect and with or without a leaderboard entry.
+app.post('/steps/sync', requireAuth, rateLimit('/steps/sync'), async (req, res) => {
+  try {
+    const uid = identityOf(req).uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'steps_unavailable' });
+    }
+    const db = firestore.getDb();
+    const incoming = normalizeDayMap((req.body || {}).days);
+    const stored = await readStepDays(db, uid);
+    const merged = { ...stored };
+    let changed = false;
+    for (const [day, steps] of Object.entries(incoming)) {
+      // A day only grows. A device that has been offline for a week must not
+      // overwrite a fuller history another device already uploaded.
+      if (steps > (merged[day] || 0)) {
+        merged[day] = steps;
+        changed = true;
+      }
+    }
+    if (changed) await writeStepDays(db, uid, merged);
+    res.json({ ok: true, stepDays: merged });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+app.get('/steps/me', requireAuth, async (req, res) => {
+  try {
+    const uid = identityOf(req).uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'steps_unavailable' });
+    }
+    const stepDays = await readStepDays(firestore.getDb(), uid);
+    res.json({ stepDays });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
 
 function habitsCompletedOn(habitData, key) {
   const list =

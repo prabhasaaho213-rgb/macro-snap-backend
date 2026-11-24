@@ -449,6 +449,89 @@ test('the cleanup cron fails closed without the secret', async () => {
   assert.equal(res.body.error, 'forbidden');
 });
 
+// ── account-scoped steps (non-members included) ──────────────────────────
+// Steps used to reach the server only through /leaderboard/sync, which refuses
+// an account with no area — so a non-member's history died with the app data.
+
+test('steps/sync stores a non-member account\'s days and echoes them back', async () => {
+  const res = makeRes();
+  await routes.post['/steps/sync'](
+    makeReq({
+      days: {
+        '2026-11-23': 8200,
+        '2026-11-24': 4100,
+        // Junk is dropped, not stored: a key that is not a day, and a
+        // negative count, must never become history.
+        notaday: 5,
+        '2026-11-22': -3,
+      },
+    }),
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.stepDays, {
+    '2026-11-23': 8200,
+    '2026-11-24': 4100,
+  });
+  assert.deepEqual(store.get('stepLog/uid1').days, {
+    '2026-11-23': 8200,
+    '2026-11-24': 4100,
+  });
+});
+
+test('steps/sync never lowers a stored day', async () => {
+  store.set('stepLog/uid1', { days: { '2026-11-24': 9000 } });
+  const res = makeRes();
+  await routes.post['/steps/sync'](
+    makeReq({ days: { '2026-11-24': 3000, '2026-11-23': 100 } }),
+    res
+  );
+  assert.deepEqual(res.body.stepDays, {
+    '2026-11-24': 9000,
+    '2026-11-23': 100,
+  });
+});
+
+test('steps/me returns the history a reinstall restores', async () => {
+  store.set('stepLog/uid1', { days: { '2026-11-20': 12000 } });
+  const res = makeRes();
+  await routes.get['/steps/me'](makeReq(), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.stepDays, { '2026-11-20': 12000 });
+});
+
+// ── rename saved against the account ─────────────────────────────────────
+test('a rename is written where a reinstall reads it back', async () => {
+  const saved = makeRes();
+  await routes.post['/user/profile'](makeReq({ name: '  Asha R  ' }), saved);
+  assert.equal(saved.statusCode, 200);
+  assert.deepEqual(saved.body, { name: 'Asha R' });
+  assert.equal(store.get('userIndex/a@example.com').name, 'Asha R');
+  assert.equal(store.get('users/uid1').name, 'Asha R');
+
+  // The exact call a fresh install makes after signing in.
+  const restored = makeRes();
+  await routes.get['/user/profile'](makeReq(), restored);
+  assert.deepEqual(restored.body, { name: 'Asha R' });
+});
+
+test('user/profile POST refuses an empty name', async () => {
+  const res = makeRes();
+  await routes.post['/user/profile'](makeReq({ name: '   ' }), res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.error, 'name_required');
+});
+
+test('user/profile POST updates a member row without creating one', async () => {
+  store.set('leaderboardMeta/uid1', { joined: true, name: 'Old' });
+  await routes.post['/user/profile'](makeReq({ name: 'New' }), makeRes());
+  assert.equal(store.get('leaderboardMeta/uid1').name, 'New');
+
+  store.delete('leaderboardMeta/uid1');
+  await routes.post['/user/profile'](makeReq({ name: 'Other' }), makeRes());
+  assert.equal(store.get('leaderboardMeta/uid1'), undefined);
+});
+
 test('the cleanup cron deletes boards older than four weeks', async () => {
   const today = lb.todayKey();
   const oldWeek = lb.isoWeek(Date.now() - 60 * 24 * 3600 * 1000).week;
