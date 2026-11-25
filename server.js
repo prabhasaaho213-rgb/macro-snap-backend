@@ -175,6 +175,13 @@ const RATE_WINDOWS = {
   '/steps/sync': 20,
   // A rename happens a handful of times in an account's life.
   '/user/profile': 10,
+  // Creating a league mints a unique code, so it is the route worth capping.
+  '/friends/league': 5,
+  // Joining is a 6-character code typed by hand; the cap makes guessing a
+  // stranger's league impractical while a real invite never notices.
+  '/friends/join': 10,
+  '/friends/sync': 12,
+  '/friends/leave': 10,
 };
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_COLLECTION = 'rateLimits';
@@ -2320,6 +2327,110 @@ function waterOn(habitData, key) {
   return Number.isFinite(value) ? value : 0;
 }
 
+// ─── Week scoring, shared by the public board and friends leagues ────────
+// The facts and the table must be the same on both boards: a private league
+// is a smaller audience, never an easier set of rules. Extracted verbatim
+// from /leaderboard/sync so there is exactly one scoring path.
+async function scoreWeekFacts(db, uid, body, week, today) {
+  // ── Per-day client facts ────────────────────────────────────────────
+  const clientDays = new Map();
+  const rawDays = Array.isArray(body.days)
+    ? body.days
+    : Array.isArray(body.facts)
+      ? body.facts
+      : Array.isArray(body.entries)
+        ? body.entries
+        : [];
+  for (const day of rawDays) {
+    if (!day || typeof day !== 'object') continue;
+    const key = dayKeyOf(day.dateKey || day.date || day.key || day.day);
+    if (key) clientDays.set(key, day);
+  }
+  // A client that posts a single flat day still gets its steps counted.
+  if (clientDays.size === 0 && typeof body.steps !== 'undefined') {
+    clientDays.set(today, body);
+  }
+
+  // ── Server-side truth ───────────────────────────────────────────────
+  const [meals, habits, profile, weighIns, storedSteps] = await Promise.all([
+    readMealDays(db, uid),
+    readHabitDay(db, uid),
+    readDietProfile(db, uid),
+    readWeighInDays(db, uid),
+    readStepDays(db, uid),
+  ]);
+  const stepLog = { ...storedSteps };
+  const calorieTarget = lb.dietTargetCalories(profile);
+  const habitData = habits.ok ? habits.data : null;
+  const waterGoal = lb.clampInt(habitData && habitData.waterGoal, 0, 5000);
+
+  const dayPoints = [];
+  let weekPoints = 0;
+  for (const key of week.dates) {
+    if (key > today) {
+      dayPoints.push({ dateKey: key, points: 0, buckets: {} });
+      continue;
+    }
+    const client = clientDays.get(key) || {};
+    const mealsForDay = meals.ok
+      ? meals.byDay.get(key) || { count: 0, calories: 0 }
+      : { count: 0, calories: 0 };
+    const mealCount = meals.ok
+      ? mealsForDay.count
+      : lb.clampInt(client.meals, 0, 3);
+    const completedHabits = habits.ok
+      ? habitsCompletedOn(habitData, key)
+      : lb.clampInt(client.habits, 0, 3);
+    const glasses = habits.ok
+      ? waterOn(habitData, key)
+      : lb.clampInt(client.water, 0, 100);
+    const stepGoal = lb.normalizeStepGoal(
+      client.stepGoal !== undefined
+        ? client.stepGoal
+        : client.goal !== undefined
+          ? client.goal
+          : body.stepGoal
+    );
+    void stepGoal; // Scoring no longer depends on a chosen target.
+    const ceiling = key === today ? lb.stepCeiling() : 200000;
+    const claimed = lb.clampInt(
+      client.steps !== undefined ? client.steps : client.stepCount,
+      0,
+      200000
+    );
+    // Keep the HIGHEST figure seen for the day. The sensor only counts up,
+    // so a later sync reporting fewer steps (a reboot, a reinstall, a
+    // client that started late) must not walk yesterday's points back.
+    const steps = Math.min(Math.max(claimed, stepLog[key] || 0), ceiling);
+    if (steps > 0) stepLog[key] = steps;
+    const weighedIn =
+      weighIns.has(key) ||
+      client.weighIn === true ||
+      client.weighedIn === true;
+    const calorieGoalMet =
+      calorieTarget > 0 && mealsForDay.calories >= calorieTarget;
+
+    const scored = lb.scoreDay({
+      mealCount,
+      completedHabits,
+      waterGlasses: glasses,
+      waterGoal: lb.clampInt(client.waterGoal, 0, 5000) || waterGoal,
+      steps,
+      stepGoal,
+      weighedIn,
+      calorieGoalMet,
+    });
+    weekPoints += scored.points;
+    dayPoints.push({
+      dateKey: key,
+      points: scored.points,
+      buckets: scored.buckets,
+    });
+  }
+  weekPoints = Math.min(weekPoints, lb.WEEK_MAX);
+  return { dayPoints, weekPoints, stepLog };
+}
+
 app.post(
   '/leaderboard/sync',
   requireAuth,
@@ -2379,102 +2490,13 @@ app.post(
 
       const scopes = lb.boardsFor(finalState, finalDistrict);
 
-      // ── Per-day client facts ────────────────────────────────────────────
-      const clientDays = new Map();
-      const rawDays = Array.isArray(body.days)
-        ? body.days
-        : Array.isArray(body.facts)
-          ? body.facts
-          : Array.isArray(body.entries)
-            ? body.entries
-            : [];
-      for (const day of rawDays) {
-        if (!day || typeof day !== 'object') continue;
-        const key = dayKeyOf(day.dateKey || day.date || day.key || day.day);
-        if (key) clientDays.set(key, day);
-      }
-      // A client that posts a single flat day still gets its steps counted.
-      if (clientDays.size === 0 && typeof body.steps !== 'undefined') {
-        clientDays.set(today, body);
-      }
-
-      // ── Server-side truth ───────────────────────────────────────────────
-      const [meals, habits, profile, weighIns, storedSteps] = await Promise.all([
-        readMealDays(db, uid),
-        readHabitDay(db, uid),
-        readDietProfile(db, uid),
-        readWeighInDays(db, uid),
-        readStepDays(db, uid),
-      ]);
-      const stepLog = { ...storedSteps };
-      const calorieTarget = lb.dietTargetCalories(profile);
-      const habitData = habits.ok ? habits.data : null;
-      const waterGoal = lb.clampInt(habitData && habitData.waterGoal, 0, 5000);
-
-      const dayPoints = [];
-      let weekPoints = 0;
-      for (const key of week.dates) {
-        if (key > today) {
-          dayPoints.push({ dateKey: key, points: 0, buckets: {} });
-          continue;
-        }
-        const client = clientDays.get(key) || {};
-        const mealsForDay = meals.ok
-          ? meals.byDay.get(key) || { count: 0, calories: 0 }
-          : { count: 0, calories: 0 };
-        const mealCount = meals.ok
-          ? mealsForDay.count
-          : lb.clampInt(client.meals, 0, 3);
-        const completedHabits = habits.ok
-          ? habitsCompletedOn(habitData, key)
-          : lb.clampInt(client.habits, 0, 3);
-        const glasses = habits.ok
-          ? waterOn(habitData, key)
-          : lb.clampInt(client.water, 0, 100);
-        const stepGoal = lb.normalizeStepGoal(
-          client.stepGoal !== undefined
-            ? client.stepGoal
-            : client.goal !== undefined
-              ? client.goal
-              : body.stepGoal
-        );
-        void stepGoal; // Scoring no longer depends on a chosen target.
-        const ceiling = key === today ? lb.stepCeiling() : 200000;
-        const claimed = lb.clampInt(
-          client.steps !== undefined ? client.steps : client.stepCount,
-          0,
-          200000
-        );
-        // Keep the HIGHEST figure seen for the day. The sensor only counts up,
-        // so a later sync reporting fewer steps (a reboot, a reinstall, a
-        // client that started late) must not walk yesterday's points back.
-        const steps = Math.min(Math.max(claimed, stepLog[key] || 0), ceiling);
-        if (steps > 0) stepLog[key] = steps;
-        const weighedIn =
-          weighIns.has(key) ||
-          client.weighIn === true ||
-          client.weighedIn === true;
-        const calorieGoalMet =
-          calorieTarget > 0 && mealsForDay.calories >= calorieTarget;
-
-        const scored = lb.scoreDay({
-          mealCount,
-          completedHabits,
-          waterGlasses: glasses,
-          waterGoal: lb.clampInt(client.waterGoal, 0, 5000) || waterGoal,
-          steps,
-          stepGoal,
-          weighedIn,
-          calorieGoalMet,
-        });
-        weekPoints += scored.points;
-        dayPoints.push({
-          dateKey: key,
-          points: scored.points,
-          buckets: scored.buckets,
-        });
-      }
-      weekPoints = Math.min(weekPoints, lb.WEEK_MAX);
+      const { dayPoints, weekPoints, stepLog } = await scoreWeekFacts(
+        db,
+        uid,
+        body,
+        week,
+        today
+      );
 
       // ── Display name, unique on the board it lands on ──────────────────
       const claimedName =
@@ -2699,6 +2721,466 @@ app.post('/leaderboard/leave', requireAuth, async (req, res) => {
       updatedAt: new Date(),
     });
     res.json({ ok: true, joined: false });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+// ─── Private friends leagues (Pro) ─────────────────────────────────────────
+//
+// A small, invite-only weekly board for people who already know each other.
+// The score is NOT a separate number: the same `scoreWeekFacts()` pass that
+// ranks the public board writes these rows, so a private league can never pay
+// more (or less) than the public one — a "friends" board is a smaller
+// audience, not an easier set of rules.
+//
+// Collections:
+//   friendLeagues/{id}                              league meta (name, code, owner)
+//   friendLeagues/{id}/members/{uid}                membership + display name
+//   friendLeagues/{id}/weeks/{week}/entries/{uid}   the scored row
+//   friendCodes/{CODE}                              code -> league id (unique)
+//   friendIndex/{uid}                               the leagues this account is in
+//
+// Pro gate: creating and joining are the paid acts. An account that is already
+// a member keeps reading and scoring after a lapse, because one expired card
+// must not silently drop a person off a league their friends still see.
+const FRIEND_LEAGUE = 'friendLeagues';
+const FRIEND_CODES = 'friendCodes';
+const FRIEND_INDEX = 'friendIndex';
+const FRIEND_MAX_LEAGUES = 5;
+const FRIEND_MAX_MEMBERS = 50;
+const FRIEND_NAME_MAX = 30;
+const FRIEND_CODE_LENGTH = 6;
+// No 0/O/1/I: a code is read aloud and typed by hand.
+const FRIEND_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+function friendCode() {
+  let out = '';
+  for (let i = 0; i < FRIEND_CODE_LENGTH; i++) {
+    out += FRIEND_CODE_ALPHABET[crypto.randomInt(FRIEND_CODE_ALPHABET.length)];
+  }
+  return out;
+}
+
+function normalizeFriendCode(value) {
+  if (typeof value !== 'string') return null;
+  const clean = value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return clean.length === FRIEND_CODE_LENGTH ? clean : null;
+}
+
+// The league name is the only free text a user writes here. Clamped and
+// stripped the same way a board name is, with a default that cannot impersonate
+// the app.
+function cleanLeagueName(value) {
+  const clean = String(value == null ? '' : value)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!clean) return 'Friends league';
+  return clean.length > FRIEND_NAME_MAX ? clean.slice(0, FRIEND_NAME_MAX) : clean;
+}
+
+// Pro, from the verified identity: the admin claim, or users/{uid} saying the
+// account paid (or is inside a referral window). Same truth the paywall uses.
+async function isProAccount(id) {
+  if (!id || !id.uid) return false;
+  if (isAdminUser(id)) return true;
+  const ent = await entitlementsFor({
+    uid: id.uid,
+    identifier: id.identifier,
+    emailVerified: id.emailVerified,
+    isAdmin: id.isAdmin,
+  });
+  return ent.subscribed === true;
+}
+
+async function friendIndexIds(uid) {
+  const doc = await firestore.get(FRIEND_INDEX + '/' + uid);
+  const ids = doc && Array.isArray(doc.ids)
+    ? doc.ids.filter((v) => typeof v === 'string')
+    : [];
+  return [...new Set(ids)].slice(0, 20);
+}
+
+async function saveFriendIndexIds(uid, ids) {
+  return firestore.set(FRIEND_INDEX + '/' + uid, {
+    ids: [...new Set(ids)].slice(0, 20),
+    updatedAt: new Date(),
+  });
+}
+
+async function friendMembers(leagueId) {
+  const snap = await firestore
+    .getDb()
+    .collection(FRIEND_LEAGUE)
+    .doc(leagueId)
+    .collection('members')
+    .get();
+  return snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+}
+
+function joinedMs(value) {
+  if (value instanceof Date) return value.getTime();
+  if (value && typeof value.toMillis === 'function') return value.toMillis();
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// The league's board for this week. Sorted here rather than by a Firestore
+// orderBy: a league holds at most 50 rows, and this keeps the collection free
+// of an index to deploy.
+async function friendRows(leagueId, week, uid) {
+  const snap = await firestore
+    .getDb()
+    .collection(FRIEND_LEAGUE)
+    .doc(leagueId)
+    .collection('weeks')
+    .doc(week)
+    .collection('entries')
+    .get();
+  const rows = snap.docs.map((d) => {
+    const data = d.data() || {};
+    return {
+      uid: d.id,
+      name: typeof data.name === 'string' && data.name.trim()
+        ? data.name
+        : 'MacroSnap user',
+      points: Number(data.points) || 0,
+    };
+  });
+  rows.sort((a, b) => b.points - a.points || a.name.localeCompare(b.name));
+  const mine = rows.findIndex((r) => r.uid === uid);
+  return {
+    rows: rows.map((r) => ({ ...r, isMe: r.uid === uid })),
+    rank: mine >= 0 ? mine + 1 : null,
+    points: mine >= 0 ? rows[mine].points : 0,
+  };
+}
+
+async function friendLeagueView(leagueId, league, week, uid) {
+  const board = await friendRows(leagueId, week, uid);
+  return {
+    id: leagueId,
+    name: league.name || 'Friends league',
+    code: league.code || '',
+    ownerUid: league.ownerUid || '',
+    isOwner: league.ownerUid === uid,
+    memberCount: Number(league.memberCount) || board.rows.length,
+    week,
+    points: board.points,
+    rank: board.rank,
+    rows: board.rows,
+  };
+}
+
+async function listFriendLeagues(uid) {
+  const ids = await friendIndexIds(uid);
+  const week = lb.isoWeek().week;
+  const out = [];
+  const alive = [];
+  for (const id of ids) {
+    const league = await firestore.get(FRIEND_LEAGUE + '/' + id);
+    if (!league) continue; // deleted: drop the stale pointer
+    alive.push(id);
+    out.push(await friendLeagueView(id, league, week, uid));
+  }
+  if (alive.length !== ids.length) await saveFriendIndexIds(uid, alive);
+  return out;
+}
+
+async function removeFriendLeague(leagueId, code) {
+  try {
+    const db = firestore.getDb();
+    const ref = db.collection(FRIEND_LEAGUE).doc(leagueId);
+    if (typeof db.recursiveDelete === 'function') {
+      await db.recursiveDelete(ref);
+    } else {
+      await ref.delete();
+    }
+  } catch (e) {
+    console.error('[friends] league delete failed:', e && e.message);
+  }
+  if (code) await firestore.del(FRIEND_CODES + '/' + code);
+}
+
+app.post('/friends/league', requireAuth, rateLimit('/friends/league'), async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const uid = id.uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'friends_unavailable' });
+    }
+    if (!(await isProAccount(id))) {
+      return res.status(403).json({ error: 'pro_required' });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const ids = await friendIndexIds(uid);
+    if (ids.length >= FRIEND_MAX_LEAGUES) {
+      return res.status(409).json({
+        error: 'too_many_leagues',
+        limit: FRIEND_MAX_LEAGUES,
+      });
+    }
+
+    // A code must be unique FOREVER: friendCodes is the lookup, so a collision
+    // would deliver an invite to a stranger's league.
+    let code = null;
+    for (let attempt = 0; attempt < 6 && !code; attempt++) {
+      const candidate = friendCode();
+      const taken = await firestore.get(FRIEND_CODES + '/' + candidate);
+      if (!taken) code = candidate;
+    }
+    if (!code) return res.status(503).json({ error: 'code_unavailable' });
+
+    const week = lb.isoWeek().week;
+    const leagueId = crypto.randomBytes(9).toString('hex');
+    const league = {
+      name: cleanLeagueName(body.name),
+      code,
+      ownerUid: uid,
+      createdAt: new Date(),
+      week,
+      memberCount: 1,
+    };
+    const displayName = lb.publicName(
+      typeof body.displayName === 'string' ? body.displayName : ''
+    );
+
+    await firestore.set(FRIEND_LEAGUE + '/' + leagueId, league);
+    await firestore.set(FRIEND_CODES + '/' + code, {
+      leagueId,
+      createdAt: new Date(),
+    });
+    await firestore.set(FRIEND_LEAGUE + '/' + leagueId + '/members/' + uid, {
+      uid,
+      name: displayName,
+      joinedAt: new Date(),
+    });
+    // A zero row now, so the owner sees themselves on the board before the
+    // first score sync rather than an "empty" league.
+    await firestore.set(
+      FRIEND_LEAGUE + '/' + leagueId + '/weeks/' + week + '/entries/' + uid,
+      { uid, name: displayName, points: 0, week, updatedAt: new Date() }
+    );
+    await saveFriendIndexIds(uid, [...ids, leagueId]);
+
+    res.json({
+      ok: true,
+      league: await friendLeagueView(leagueId, league, week, uid),
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+app.post('/friends/join', requireAuth, rateLimit('/friends/join'), async (req, res) => {
+  try {
+    const id = identityOf(req);
+    const uid = id.uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'friends_unavailable' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const code = normalizeFriendCode(body.code);
+    if (!code) return res.status(400).json({ error: 'invalid_code' });
+    if (!(await isProAccount(id))) {
+      return res.status(403).json({ error: 'pro_required' });
+    }
+
+    const pointer = await firestore.get(FRIEND_CODES + '/' + code);
+    const leagueId =
+      pointer && typeof pointer.leagueId === 'string' ? pointer.leagueId : null;
+    const league = leagueId
+      ? await firestore.get(FRIEND_LEAGUE + '/' + leagueId)
+      : null;
+    if (!leagueId || !league) {
+      return res.status(404).json({ error: 'code_not_found' });
+    }
+
+    const week = lb.isoWeek().week;
+    const ids = await friendIndexIds(uid);
+    if (ids.includes(leagueId)) {
+      return res.json({
+        ok: true,
+        alreadyMember: true,
+        league: await friendLeagueView(leagueId, league, week, uid),
+      });
+    }
+    if (ids.length >= FRIEND_MAX_LEAGUES) {
+      return res.status(409).json({
+        error: 'too_many_leagues',
+        limit: FRIEND_MAX_LEAGUES,
+      });
+    }
+
+    const members = await friendMembers(leagueId);
+    if (members.length >= FRIEND_MAX_MEMBERS) {
+      return res.status(409).json({ error: 'league_full' });
+    }
+
+    const joinerName = lb.publicName(
+      typeof body.displayName === 'string' ? body.displayName : ''
+    );
+    await firestore.set(FRIEND_LEAGUE + '/' + leagueId + '/members/' + uid, {
+      uid,
+      name: joinerName,
+      joinedAt: new Date(),
+    });
+    // A zero row now, so a new member appears on the board immediately.
+    await firestore.set(
+      FRIEND_LEAGUE + '/' + leagueId + '/weeks/' + week + '/entries/' + uid,
+      { uid, name: joinerName, points: 0, week, updatedAt: new Date() }
+    );
+    await firestore.set(
+      FRIEND_LEAGUE + '/' + leagueId,
+      { memberCount: members.length + 1 },
+      { merge: true }
+    );
+    await saveFriendIndexIds(uid, [...ids, leagueId]);
+
+    const fresh =
+      (await firestore.get(FRIEND_LEAGUE + '/' + leagueId)) || league;
+    res.json({
+      ok: true,
+      league: await friendLeagueView(leagueId, fresh, week, uid),
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+app.get('/friends/leagues', requireAuth, async (req, res) => {
+  try {
+    const uid = identityOf(req).uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'friends_unavailable' });
+    }
+    res.json({
+      ok: true,
+      week: lb.isoWeek().week,
+      leagues: await listFriendLeagues(uid),
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+// Scores the week once and writes the row into every league this account is
+// still a member of. The phone sends the same raw facts as the public sync; the
+// server decides every point.
+app.post('/friends/sync', requireAuth, rateLimit('/friends/sync'), async (req, res) => {
+  try {
+    const uid = identityOf(req).uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'friends_unavailable' });
+    }
+    const db = firestore.getDb();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const week = lb.isoWeek();
+    const today = lb.todayKey();
+
+    const ids = await friendIndexIds(uid);
+    if (!ids.length) {
+      return res.json({ ok: true, week: week.week, points: 0, leagues: [] });
+    }
+
+    const scored = await scoreWeekFacts(db, uid, body, week, today);
+    // Persist the merged step history before the rows, exactly like the public
+    // sync: a row that survives without its steps would score zero tomorrow.
+    await writeStepDays(db, uid, scored.stepLog);
+    const name = lb.publicName(
+      typeof body.name === 'string' ? body.name : ''
+    );
+
+    const leagues = [];
+    const alive = [];
+    for (const leagueId of ids) {
+      const league = await firestore.get(FRIEND_LEAGUE + '/' + leagueId);
+      if (!league) continue;
+      const memberPath = FRIEND_LEAGUE + '/' + leagueId + '/members/' + uid;
+      const member = await firestore.get(memberPath);
+      if (!member) continue; // removed from the group: never write a row back
+      alive.push(leagueId);
+      await firestore.set(memberPath, { name }, { merge: true });
+      await firestore.set(
+        FRIEND_LEAGUE + '/' + leagueId + '/weeks/' + week.week +
+          '/entries/' + uid,
+        {
+          uid,
+          name,
+          points: scored.weekPoints,
+          week: week.week,
+          updatedAt: new Date(),
+        }
+      );
+      leagues.push(await friendLeagueView(leagueId, league, week.week, uid));
+    }
+    if (alive.length !== ids.length) await saveFriendIndexIds(uid, alive);
+
+    res.json({
+      ok: true,
+      week: week.week,
+      points: scored.weekPoints,
+      dayPoints: scored.dayPoints,
+      leagues,
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+app.post('/friends/leave', requireAuth, rateLimit('/friends/leave'), async (req, res) => {
+  try {
+    const uid = identityOf(req).uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'friends_unavailable' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const leagueId = typeof body.leagueId === 'string' ? body.leagueId : '';
+    if (!/^[a-f0-9]{8,32}$/.test(leagueId)) {
+      return res.status(400).json({ error: 'invalid_league' });
+    }
+
+    const ids = await friendIndexIds(uid);
+    if (!ids.includes(leagueId)) {
+      return res.status(404).json({ error: 'not_a_member' });
+    }
+    const league = await firestore.get(FRIEND_LEAGUE + '/' + leagueId);
+
+    await firestore.del(FRIEND_LEAGUE + '/' + leagueId + '/members/' + uid);
+    await saveFriendIndexIds(uid, ids.filter((v) => v !== leagueId));
+
+    const remaining = await friendMembers(leagueId);
+    if (!league || remaining.length === 0) {
+      // The last member leaving takes the league and its code with them.
+      await removeFriendLeague(leagueId, league && league.code);
+      return res.json({ ok: true, deleted: true });
+    }
+
+    // An owner who leaves hands the league to its longest-standing member
+    // rather than stranding a group with nobody able to administer it.
+    if (league.ownerUid === uid) {
+      const next = remaining
+        .slice()
+        .sort((a, b) => joinedMs(a.joinedAt) - joinedMs(b.joinedAt))[0];
+      await firestore.set(
+        FRIEND_LEAGUE + '/' + leagueId,
+        { ownerUid: next.id },
+        { merge: true }
+      );
+    }
+    await firestore.set(
+      FRIEND_LEAGUE + '/' + leagueId,
+      { memberCount: remaining.length },
+      { merge: true }
+    );
+    res.json({ ok: true, deleted: false });
   } catch (e) {
     return sendFailure(req, res, e);
   }
