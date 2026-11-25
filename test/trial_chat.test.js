@@ -437,16 +437,26 @@ test('chat: a per-user rate limit caps how much one account can spend', async ()
   assert.equal(gemini.bodies.length, 30, 'exactly the capped number reached Gemini');
 });
 
-test('chat: fails closed when the shared rate-limit store is unavailable', async () => {
+test('chat: falls back to a local counter when the shared rate-limit store is down', async () => {
   const pro = makeProUser();
   failSharedTransactions = true;
+  for (let i = 0; i < 30; i++) gemini.replies.push('ok');
 
-  const res = makeRes();
-  await callRoute('post', '/chat', makeReq({ message: 'protein in paneer?', phone: pro }), res);
+  // A store outage must not take the route offline...
+  const first = makeRes();
+  await callRoute('post', '/chat', makeReq({ message: 'protein in paneer?', phone: pro }), first);
+  assert.equal(first.statusCode, 200);
+  assert.equal(gemini.bodies.length, 1, 'Gemini is reached on the local fallback');
 
-  assert.equal(res.statusCode, 503);
-  assert.equal(res.payload.error, 'rate_limit_unavailable');
-  assert.equal(gemini.bodies.length, 0, 'Gemini must not be called without a shared counter');
+  // ...and the fallback still throttles a runaway client in the same window.
+  let last;
+  for (let i = 0; i < 30; i++) {
+    last = makeRes();
+    await callRoute('post', '/chat', makeReq({ message: `q ${i}`, phone: pro }), last);
+  }
+  assert.equal(last.statusCode, 429, 'the local counter still caps the window');
+  assert.equal(last.payload.error, 'rate_limited');
+  assert.ok(last.headers['Retry-After'] !== undefined);
 });
 
 test('chat: food-only system instruction + capped history + reply passthrough', async () => {

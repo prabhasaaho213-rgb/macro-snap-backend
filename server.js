@@ -182,6 +182,11 @@ const RATE_WINDOWS = {
   '/friends/join': 10,
   '/friends/sync': 12,
   '/friends/leave': 10,
+  // Unauthenticated install/join analytics: each call writes a new
+  // inviteEvents document, so an open loop is a way to inflate the database
+  // and the bill. A real client sends a handful per install; this cap stops
+  // spam without touching a legitimate flow.
+  '/join/event': 20,
 };
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_COLLECTION = 'rateLimits';
@@ -230,6 +235,25 @@ async function sharedRateLimitFor(bucketKey, limit) {
   return retryAfterMs;
 }
 
+// Per-process fallback for the shared limiter. Failing closed turned a
+// Firestore hiccup into a 503 on every limited route, so the API went down
+// whenever its rate-limit store did. A local counter still stops a runaway
+// client on this instance; it is per instance, so the cap is weaker while the
+// shared store is unavailable — an acceptable trade for availability.
+const memoryLimits = new Map();
+function memoryRateLimitFor(bucketKey, limit) {
+  const now = Date.now();
+  if (memoryLimits.size > 10000) memoryLimits.clear();
+  const entry = memoryLimits.get(bucketKey);
+  if (!entry || now - entry.startMs >= RATE_WINDOW_MS) {
+    memoryLimits.set(bucketKey, { startMs: now, count: 1 });
+    return null;
+  }
+  entry.count += 1;
+  if (entry.count > limit) return entry.startMs + RATE_WINDOW_MS - now;
+  return null;
+}
+
 // Express guard for one of the RATE_WINDOWS routes. 429 with Retry-After.
 function rateLimit(route) {
   const limit = RATE_WINDOWS[route];
@@ -240,11 +264,10 @@ function rateLimit(route) {
     try {
       retryAfterMs = await sharedRateLimitFor(key + ':' + route, limit);
     } catch (e) {
-      console.error('Shared rate-limit check failed:', e.message);
-      return res.status(503).json({
-        error: 'rate_limit_unavailable',
-        message: 'This service is temporarily unavailable. Please try again shortly.',
-      });
+      // Fail OPEN to the local counter: a store outage must not take every
+      // limited route offline.
+      console.warn('Shared rate-limit check failed, using local counter:', e.message);
+      retryAfterMs = memoryRateLimitFor(key + ':' + route, limit);
     }
     if (retryAfterMs == null) return next();
     res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
@@ -2809,6 +2832,55 @@ async function isProAccount(id) {
   return ent.subscribed === true;
 }
 
+// Days of Pro granted to a free account that joins through an invite, or 0.
+//
+// An invite is the highest-intent moment a free account will ever have, and
+// the old answer was a paywall. Off unless INVITE_TRIAL_DAYS is set: this is a
+// pricing decision, so the code ships inert and the owner turns it on.
+const INVITE_TRIAL_DAYS = Math.max(0, Number(process.env.INVITE_TRIAL_DAYS) || 0);
+
+async function grantInviteTrial(uid) {
+  if (!(INVITE_TRIAL_DAYS > 0) || !uid || !firestore.isEnabled()) return 0;
+  try {
+    const ref = firestore.getDb().collection('users').doc(uid);
+    const doc = await ref.get();
+    const d = (doc.exists ? doc.data() : {}) || {};
+    // One window per ACCOUNT, so reinstalling does not farm trials.
+    if (d.invite_trial_used === true) return 0;
+    const until = new Date(Date.now() + INVITE_TRIAL_DAYS * 86400000);
+    await ref.set(
+      { pro_until: until, invite_trial_used: true },
+      { merge: true }
+    );
+    return INVITE_TRIAL_DAYS;
+  } catch (e) {
+    console.error('[friends] invite trial failed:', e && e.message);
+    return 0;
+  }
+}
+
+// Members who arrived through an invite, newest first — what the inviter sees
+// as "Riya joined with your invite". Capped and name-only: the league board
+// already shows points, this is the social half.
+async function friendInvites(leagueId, uid) {
+  try {
+    const members = await friendMembers(leagueId);
+    return members
+      .filter((m) => m.via === 'invite' && m.id !== uid)
+      .sort((a, b) => joinedMs(b.joinedAt) - joinedMs(a.joinedAt))
+      .slice(0, 5)
+      .map((m) => ({
+        name:
+          typeof m.name === 'string' && m.name.trim()
+            ? m.name.trim()
+            : 'MacroSnap user',
+        at: joinedMs(m.joinedAt),
+      }));
+  } catch (_) {
+    return [];
+  }
+}
+
 async function friendIndexIds(uid) {
   const doc = await firestore.get(FRIEND_INDEX + '/' + uid);
   const ids = doc && Array.isArray(doc.ids)
@@ -2885,6 +2957,7 @@ async function friendLeagueView(leagueId, league, week, uid) {
     points: board.points,
     rank: board.rank,
     rows: board.rows,
+    invites: await friendInvites(leagueId, uid),
   };
 }
 
@@ -2917,6 +2990,137 @@ async function removeFriendLeague(leagueId, code) {
   }
   if (code) await firestore.del(FRIEND_CODES + '/' + code);
 }
+
+// ─── Friends-league invite links ──────────────────────────────────────────
+// A shared invite is a plain https link: https://<host>/join/ABC123.
+//
+// Android intercepts it when MacroSnap is installed (the app registers this
+// host as an app link and applies the code), so this route is what runs when
+// the app is NOT installed: it sends the visitor to the Play Store with the
+// code carried in the install referrer, so a fresh install can still land on
+// the right league.
+//
+// Deliberately unauthenticated and side-effect free: it stores nothing, so a
+// guessed code reveals nothing and a broken link still installs the app.
+const PLAY_STORE_URL =
+  'https://play.google.com/store/apps/details?id=com.macrosnap.macro_snap';
+
+// Android App Links verification. Without this file Android refuses to open
+// https://<host>/join/CODE in the app and every invite falls through to the
+// browser, even for someone who already has MacroSnap.
+//
+// The fingerprints are the app-signing certificate SHA-256s (Play Console →
+// App integrity → App signing key certificate), a comma-separated list so the
+// upload key and Play's signing key can both be trusted during a rollout. The
+// variable is configuration, not code: the certificate is public, so no
+// secret material lives here.
+app.get('/.well-known/assetlinks.json', (req, res) => {
+  const fingerprints = String(process.env.ASSETLINKS_SHA256 || '')
+    .split(/[,\s]+/)
+    .map((v) => v.trim().toUpperCase())
+    .filter((v) => /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(v));
+  res.set('Cache-Control', 'public, max-age=300');
+  res.type('application/json');
+  if (!fingerprints.length) {
+    console.warn(
+      '[applinks] ASSETLINKS_SHA256 is not set — /join links will open in the browser'
+    );
+    return res.json([]);
+  }
+  return res.json([
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: {
+        namespace: 'android_app',
+        package_name: 'com.macrosnap.macro_snap',
+        sha256_cert_fingerprints: fingerprints,
+      },
+    },
+  ]);
+});
+
+// The page an invitee sees when the link is opened anywhere but Android: the
+// store link is useless on an iPhone or a laptop, so show the code itself and
+// let them type it into the app (or send it to an Android phone).
+function joinLandingPage(code) {
+  const codeLine = code
+    ? `<p class="code" id="code">${code}</p>
+       <button onclick="navigator.clipboard&&navigator.clipboard.writeText('${code}');this.textContent='Copied'">Copy code</button>`
+    : `<p class="muted">This invite link is incomplete. Ask your friend to share it again.</p>`;
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Join a MacroSnap league</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#0B0B0F;color:#fff;font-family:-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:380px;padding:32px 24px;text-align:center}
+h1{font-size:20px;margin:0 0 8px}
+p{font-size:14px;line-height:1.5;color:#B9B4C7;margin:0 0 18px}
+.code{font-size:34px;letter-spacing:8px;font-weight:800;color:#FF6B2B;margin:18px 0}
+button{background:#FF6B2B;color:#0B0B0F;border:0;border-radius:12px;padding:12px 22px;
+font-size:15px;font-weight:700}
+a{display:block;margin-top:22px;color:#B9B4C7;font-size:13px}
+</style></head><body><main>
+<h1>You have a MacroSnap league invite</h1>
+${codeLine}
+<p>Open MacroSnap and enter this code under Friends league to join.</p>
+<a href="${PLAY_STORE_URL}">Get MacroSnap for Android</a>
+</main></body></html>`;
+}
+
+app.get('/join/:code', (req, res) => {
+  const raw = String(req.params.code || '').trim();
+  const code = /^[A-Za-z0-9]{6}$/.test(raw) ? raw.toUpperCase() : null;
+  res.set('Cache-Control', 'no-store');
+  // Android is the only platform that can install straight from here, and the
+  // only one that can hand the code to the app through the install referrer.
+  if (!/android/i.test(String(req.headers['user-agent'] || ''))) {
+    res.type('html').send(joinLandingPage(code));
+    return;
+  }
+  const target = code
+    ? `${PLAY_STORE_URL}&referrer=${encodeURIComponent(`join_code=${code}`)}`
+    : PLAY_STORE_URL;
+  return res.redirect(302, target);
+});
+
+// Invite-funnel counters. One document per event, so the owner can count
+// installs→opens→joins with a Firestore query instead of guessing whether the
+// link, the referrer or the paywall is where invites die. Unauthenticated on
+// purpose: the referrer is read before anyone signs in. Only the fixed event
+// names below are accepted, and the body is never trusted for anything else.
+const INVITE_EVENTS = new Set([
+  'referrer',
+  'link_open',
+  'screen_open',
+  'join_attempt',
+  'join_ok',
+  'join_fail',
+]);
+
+app.post('/join/event', rateLimit('/join/event'), async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const event = typeof body.event === 'string' ? body.event : '';
+    // Validate before anything else, so the contract holds even where
+    // Firestore is not configured.
+    if (!INVITE_EVENTS.has(event)) {
+      return res.status(400).json({ error: 'invalid_event' });
+    }
+    if (!firestore.isEnabled()) return res.json({ ok: true, skipped: true });
+    const code = normalizeFriendCode(body.code) || '';
+    const id = crypto.randomBytes(8).toString('hex');
+    await firestore.set('inviteEvents/' + id, {
+      event,
+      code,
+      at: new Date(),
+    });
+    return res.json({ ok: true });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
 
 app.post('/friends/league', requireAuth, rateLimit('/friends/league'), async (req, res) => {
   try {
@@ -2990,6 +3194,43 @@ app.post('/friends/league', requireAuth, rateLimit('/friends/league'), async (re
   }
 });
 
+// What a code points at, without joining. Lets the app say "that invite
+// expired" or "that league is full" before it opens a league screen or sends
+// a free account into the paywall, instead of failing after the fact.
+app.get('/friends/invite/:code', requireAuth, async (req, res) => {
+  try {
+    const uid = identityOf(req).uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'friends_unavailable' });
+    }
+    const code = normalizeFriendCode(req.params.code);
+    if (!code) return res.status(400).json({ error: 'invalid_code' });
+    const pointer = await firestore.get(FRIEND_CODES + '/' + code);
+    const leagueId =
+      pointer && typeof pointer.leagueId === 'string' ? pointer.leagueId : null;
+    const league = leagueId
+      ? await firestore.get(FRIEND_LEAGUE + '/' + leagueId)
+      : null;
+    if (!leagueId || !league) {
+      return res.status(404).json({ error: 'code_not_found' });
+    }
+    const members = await friendMembers(leagueId);
+    const ids = await friendIndexIds(uid);
+    return res.json({
+      ok: true,
+      valid: true,
+      code,
+      name: cleanLeagueName(league.name),
+      memberCount: members.length,
+      full: members.length >= FRIEND_MAX_MEMBERS,
+      alreadyMember: ids.includes(leagueId),
+    });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
 app.post('/friends/join', requireAuth, rateLimit('/friends/join'), async (req, res) => {
   try {
     const id = identityOf(req);
@@ -3001,8 +3242,13 @@ app.post('/friends/join', requireAuth, rateLimit('/friends/join'), async (req, r
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const code = normalizeFriendCode(body.code);
     if (!code) return res.status(400).json({ error: 'invalid_code' });
+    let trialDays = 0;
     if (!(await isProAccount(id))) {
-      return res.status(403).json({ error: 'pro_required' });
+      // A free account that came here through an invite gets the configured
+      // window instead of a paywall — one per account, and 0 (paywall) when
+      // INVITE_TRIAL_DAYS is unset.
+      trialDays = await grantInviteTrial(uid);
+      if (!trialDays) return res.status(403).json({ error: 'pro_required' });
     }
 
     const pointer = await firestore.get(FRIEND_CODES + '/' + code);
@@ -3043,6 +3289,10 @@ app.post('/friends/join', requireAuth, rateLimit('/friends/join'), async (req, r
       uid,
       name: joinerName,
       joinedAt: new Date(),
+      // How this member arrived: what the inviter's "joined with your invite"
+      // line is built from.
+      via: 'invite',
+      invitedByCode: code,
     });
     // A zero row now, so a new member appears on the board immediately.
     await firestore.set(
@@ -3060,6 +3310,7 @@ app.post('/friends/join', requireAuth, rateLimit('/friends/join'), async (req, r
       (await firestore.get(FRIEND_LEAGUE + '/' + leagueId)) || league;
     res.json({
       ok: true,
+      trialDays,
       league: await friendLeagueView(leagueId, fresh, week, uid),
     });
   } catch (e) {
