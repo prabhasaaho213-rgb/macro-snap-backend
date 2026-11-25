@@ -2116,6 +2116,8 @@ app.delete('/meals/:mealId/photo', requireAuth, async (req, res) => {
 // bounded (`stepCeiling` refuses "20,000 steps at 00:30").
 const MAX_MOVES_PER_WEEK = 3;
 const LEADERBOARD_META = 'leaderboardMeta';
+// The free plan's daily step ceiling. Must match StepLimit.freeDaily in the app.
+const FREE_STEP_CAP = 5000;
 
 function dayKeyOf(value) {
   if (typeof value === 'string') {
@@ -2331,7 +2333,7 @@ function waterOn(habitData, key) {
 // The facts and the table must be the same on both boards: a private league
 // is a smaller audience, never an easier set of rules. Extracted verbatim
 // from /leaderboard/sync so there is exactly one scoring path.
-async function scoreWeekFacts(db, uid, body, week, today) {
+async function scoreWeekFacts(db, uid, body, week, today, stepCap = null) {
   // ── Per-day client facts ────────────────────────────────────────────
   const clientDays = new Map();
   const rawDays = Array.isArray(body.days)
@@ -2401,8 +2403,16 @@ async function scoreWeekFacts(db, uid, body, week, today) {
     // Keep the HIGHEST figure seen for the day. The sensor only counts up,
     // so a later sync reporting fewer steps (a reboot, a reinstall, a
     // client that started late) must not walk yesterday's points back.
-    const steps = Math.min(Math.max(claimed, stepLog[key] || 0), ceiling);
-    if (steps > 0) stepLog[key] = steps;
+    const rawSteps = Math.min(
+      Math.max(claimed, stepLog[key] || 0),
+      ceiling
+    );
+    // The RAW total is what the account keeps: a free user who upgrades later
+    // must see the steps already walked, not a history rewritten to 5,000.
+    if (rawSteps > 0) stepLog[key] = rawSteps;
+    // What this week may be SCORED on. A free account is capped at 5,000 steps
+    // a day; the cap is applied to the score, never to the stored history.
+    const steps = stepCap == null ? rawSteps : Math.min(rawSteps, stepCap);
     const weighedIn =
       weighIns.has(key) ||
       client.weighIn === true ||
@@ -2490,12 +2500,17 @@ app.post(
 
       const scopes = lb.boardsFor(finalState, finalDistrict);
 
+      // Movement is the one bucket no stored document proves, so the free
+      // tier's step ceiling is enforced server-side too: a modified client
+      // must not be able to buy the whole 100 movement points.
+      const pro = await isProAccount(id);
       const { dayPoints, weekPoints, stepLog } = await scoreWeekFacts(
         db,
         uid,
         body,
         week,
-        today
+        today,
+        pro ? null : FREE_STEP_CAP
       );
 
       // ── Display name, unique on the board it lands on ──────────────────
@@ -3074,7 +3089,8 @@ app.get('/friends/leagues', requireAuth, async (req, res) => {
 // server decides every point.
 app.post('/friends/sync', requireAuth, rateLimit('/friends/sync'), async (req, res) => {
   try {
-    const uid = identityOf(req).uid;
+    const id = identityOf(req);
+    const uid = id.uid;
     if (!uid) return res.status(400).json({ error: 'identity_required' });
     if (!firestore.isEnabled()) {
       return res.status(503).json({ error: 'friends_unavailable' });
@@ -3089,7 +3105,17 @@ app.post('/friends/sync', requireAuth, rateLimit('/friends/sync'), async (req, r
       return res.json({ ok: true, week: week.week, points: 0, leagues: [] });
     }
 
-    const scored = await scoreWeekFacts(db, uid, body, week, today);
+    // A member whose Pro lapsed keeps scoring, but on the free ceiling: the
+    // league must not become a way around the step limit.
+    const pro = await isProAccount(id);
+    const scored = await scoreWeekFacts(
+      db,
+      uid,
+      body,
+      week,
+      today,
+      pro ? null : FREE_STEP_CAP
+    );
     // Persist the merged step history before the rows, exactly like the public
     // sync: a row that survives without its steps would score zero tomorrow.
     await writeStepDays(db, uid, scored.stepLog);
@@ -4577,6 +4603,9 @@ if (require.main === module) {
 
 module.exports = app;
 module.exports._rateLimits = RATE_WINDOWS;
+// Test seam: the shared week scorer (step ceiling behaviour is unit-tested
+// without needing the clock to cooperate).
+module.exports._scoreWeekFacts = scoreWeekFacts;
 // Test hook: the deletion tombstone's fingerprint and retention window. The
 // retained record must not be a readable identifier, and that is worth a test
 // rather than a comment (test/tombstone.test.js).

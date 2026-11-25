@@ -163,7 +163,7 @@ Module._load = function (request) {
 };
 
 process.env.CRON_SECRET = 'test-cron-secret';
-require('../server.js');
+const server = require('../server.js');
 Module._load = origLoad;
 
 function makeRes() {
@@ -561,4 +561,39 @@ test('the cleanup cron deletes boards older than four weeks', async () => {
   );
   assert.ok(store.get(`leaderboard/${thisWeek}/scopes/india/entries/uid1`));
   assert.ok(today);
+});
+
+test('the free step ceiling caps the score, not the stored history', async () => {
+  const week = lb.isoWeek();
+  const monday = week.dates[0];
+  // "Today" after the whole week, so the phone-clock ceiling never binds and
+  // this measures the plan's 5,000 cap and nothing else.
+  const afterWeek = lb.addDays(week.dates[6], 1);
+  const body = { days: [{ dateKey: monday, steps: 20000 }] };
+
+  const free = await server._scoreWeekFacts(
+    db,
+    'uid1',
+    body,
+    week,
+    afterWeek,
+    5000
+  );
+  const pro = await server._scoreWeekFacts(
+    db,
+    'uid1',
+    body,
+    week,
+    afterWeek,
+    null
+  );
+
+  // 10 points per 5,000 steps: the free plan banks one award, Pro banks four.
+  assert.equal(free.dayPoints[0].buckets.movement, 10);
+  assert.equal(pro.dayPoints[0].buckets.movement, 40);
+  assert.equal(
+    free.stepLog[monday],
+    20000,
+    'the raw total must survive so an upgrade reveals it'
+  );
 });
