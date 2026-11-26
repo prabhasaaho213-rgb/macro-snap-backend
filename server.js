@@ -175,9 +175,9 @@ const RATE_WINDOWS = {
   '/steps/sync': 20,
   // A rename happens a handful of times in an account's life.
   '/user/profile': 10,
-  // A picture change is cheap, but it is still a write: enough for someone
-  // trying the avatars out, far too few to be used as a write pump.
-  '/profile/avatar': 15,
+  // A profile edit is cheap, but it is still a write: enough for someone
+  // trying names and avatars out, far too few to be used as a write pump.
+  '/profile/publish': 15,
   // Creating a league mints a unique code, so it is the route worth capping.
   '/friends/league': 5,
   // Joining is a 6-character code typed by hand; the cap makes guessing a
@@ -3503,13 +3503,16 @@ app.post('/friends/sync', requireAuth, rateLimit('/friends/sync'), async (req, r
 
 // A profile edit is not a scoring round.
 //
-// Changing the picture used to call /leaderboard/sync AND /friends/sync — two
-// full passes that re-read a week of meals, habits, water and weigh-ins to
-// recompute points a new picture cannot move, and that wrote board rows for an
-// account which had never joined. This route writes ONLY the avatar, and only
-// onto rows that ALREADY EXIST: an account with no board and no league costs a
-// single document read and writes nothing at all.
-app.post('/profile/avatar', requireAuth, rateLimit('/profile/avatar'), async (req, res) => {
+// Renaming or changing the picture used to call /leaderboard/sync AND
+// /friends/sync — two full passes that re-read a week of meals, habits, water
+// and weigh-ins to recompute points a label cannot move, and that wrote board
+// rows for an account which had never joined. This route writes only the fields
+// that changed, and only onto rows that ALREADY EXIST: an account with no board
+// and no league costs a single document read and writes nothing at all.
+//
+// The display name is de-duplicated exactly as the scoring sync does it, so a
+// rename cannot put two identical names on one board.
+app.post('/profile/publish', requireAuth, rateLimit('/profile/publish'), async (req, res) => {
   try {
     const uid = identityOf(req).uid;
     if (!uid) return res.status(400).json({ error: 'identity_required' });
@@ -3517,11 +3520,52 @@ app.post('/profile/avatar', requireAuth, rateLimit('/profile/avatar'), async (re
       return res.status(503).json({ error: 'profile_unavailable' });
     }
     const body = req.body && typeof req.body === 'object' ? req.body : {};
-    // The same sanitiser as the sync: these rows are drawn on other people's
-    // phones, so only a shipped illustration may be published.
-    const avatar = lb.publicAvatar(body.avatar);
+    // Presence, not truthiness: an EMPTY avatar is a real edit that clears the
+    // picture, while an absent field means "leave it alone".
+    const hasAvatar = Object.prototype.hasOwnProperty.call(body, 'avatar');
+    const hasName =
+      typeof body.name === 'string' && body.name.trim().length > 0;
+    if (!hasAvatar && !hasName) {
+      return res.status(400).json({ error: 'nothing_to_update' });
+    }
+    const fields = {};
+    if (hasAvatar) fields.avatar = lb.publicAvatar(body.avatar);
+
     const db = firestore.getDb();
     const week = lb.isoWeek().week;
+
+    // ── Where this account is, if anywhere ─────────────────────────────────
+    const meta = await firestore.get(LEADERBOARD_META + '/' + uid);
+    const stateKey = meta ? lb.stateKey(meta.stateKey) : null;
+    const districtKey = meta ? lb.slug(meta.districtKey || '') : '';
+    const onBoard =
+      !!meta && meta.joined === true && meta.week === week && stateKey && districtKey;
+    const scopes = onBoard ? lb.boardsFor(stateKey, districtKey) : [];
+
+    // ── Display name, unique on the board it lands on ──────────────────────
+    if (hasName) {
+      let name = lb.publicName(body.name);
+      if (onBoard) {
+        try {
+          // The same check as the sync, narrowed to the one board a clash can
+          // happen on. A failed read publishes the plain name rather than
+          // failing the rename.
+          const snap = await db
+            .collection('leaderboard')
+            .doc(week)
+            .collection('scopes')
+            .doc(scopes[2])
+            .collection('entries')
+            .get();
+          const taken = snap.docs
+            .filter((d) => d.id !== uid)
+            .map((d) => (d.data() || {}).name)
+            .filter((n) => typeof n === 'string');
+          name = lb.uniqueName(name, uid, taken);
+        } catch (_) {}
+      }
+      fields.name = name;
+    }
 
     const batch = db.batch();
     let writes = 0;
@@ -3529,34 +3573,21 @@ app.post('/profile/avatar', requireAuth, rateLimit('/profile/avatar'), async (re
     let leagues = 0;
 
     // ── Public board: this week's rows, where the account already has one ──
-    const meta = await firestore.get(LEADERBOARD_META + '/' + uid);
-    const stateKey = meta ? lb.stateKey(meta.stateKey) : null;
-    const districtKey = meta ? lb.slug(meta.districtKey || '') : '';
-    // Same week AND joined: an older week's row is not this profile's board,
-    // and an account that never joined has no row to touch.
-    if (
-      meta &&
-      meta.joined === true &&
-      meta.week === week &&
-      stateKey &&
-      districtKey
-    ) {
-      for (const scope of lb.boardsFor(stateKey, districtKey)) {
-        const ref = db
-          .collection('leaderboard')
-          .doc(week)
-          .collection('scopes')
-          .doc(scope)
-          .collection('entries')
-          .doc(uid);
-        const snap = await ref.get();
-        // Never create a row from a profile edit: that would be joining a
-        // board through the avatar picker.
-        if (!snap.exists) continue;
-        batch.set(ref, { avatar, updatedAt: new Date() }, { merge: true });
-        writes += 1;
-        boards += 1;
-      }
+    for (const scope of scopes) {
+      const ref = db
+        .collection('leaderboard')
+        .doc(week)
+        .collection('scopes')
+        .doc(scope)
+        .collection('entries')
+        .doc(uid);
+      const snap = await ref.get();
+      // Never create a row from a profile edit: that would be joining a board
+      // through the name or picture editor.
+      if (!snap.exists) continue;
+      batch.set(ref, { ...fields, updatedAt: new Date() }, { merge: true });
+      writes += 1;
+      boards += 1;
     }
 
     // ── Private leagues: membership and this week's league row ─────────────
@@ -3567,7 +3598,7 @@ app.post('/profile/avatar', requireAuth, rateLimit('/profile/avatar'), async (re
         .collection('members');
       const memberSnap = await members.doc(uid).get();
       if (memberSnap.exists) {
-        batch.set(members.doc(uid), { avatar }, { merge: true });
+        batch.set(members.doc(uid), fields, { merge: true });
         writes += 1;
         leagues += 1;
       }
@@ -3580,22 +3611,26 @@ app.post('/profile/avatar', requireAuth, rateLimit('/profile/avatar'), async (re
         .doc(uid);
       const rowSnap = await rowRef.get();
       if (rowSnap.exists) {
-        batch.set(rowRef, { avatar }, { merge: true });
+        batch.set(rowRef, fields, { merge: true });
         writes += 1;
       }
     }
 
     if (writes) await batch.commit();
     // Keep the meta copy in step even when there is no row yet, so the next
-    // scoring sync does not write a stale picture back over this one.
+    // scoring sync does not write the old label or picture back over this one.
     if (meta && meta.joined === true) {
       await firestore.set(
         LEADERBOARD_META + '/' + uid,
-        { avatar },
+        fields,
         { merge: true }
       );
     }
-    return res.json({ ok: true, boards, leagues });
+    // `name` only when a name was published, so an avatar-only push answers
+    // exactly what it did before (and never sends an undefined field).
+    const out = { ok: true, boards, leagues };
+    if (fields.name) out.name = fields.name;
+    return res.json(out);
   } catch (e) {
     return sendFailure(req, res, e);
   }
