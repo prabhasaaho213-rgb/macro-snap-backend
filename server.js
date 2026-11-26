@@ -175,6 +175,9 @@ const RATE_WINDOWS = {
   '/steps/sync': 20,
   // A rename happens a handful of times in an account's life.
   '/user/profile': 10,
+  // A picture change is cheap, but it is still a write: enough for someone
+  // trying the avatars out, far too few to be used as a write pump.
+  '/profile/avatar': 15,
   // Creating a league mints a unique code, so it is the route worth capping.
   '/friends/league': 5,
   // Joining is a 6-character code typed by hand; the cap makes guessing a
@@ -2544,6 +2547,9 @@ app.post(
             ? body.displayName
             : (meta && meta.name) || '';
       let name = lb.publicName(claimedName);
+      // The picture rides with the row: the boards are read straight from
+      // these documents by every other phone, so the avatar has to be in them.
+      const avatar = lb.publicAvatar(body.avatar);
       try {
         const snap = await db
           .collection('leaderboard')
@@ -2590,6 +2596,7 @@ app.post(
           {
             uid,
             name,
+            avatar,
             points: weekPoints,
             week: week.week,
             scope,
@@ -2627,6 +2634,7 @@ app.post(
         districtKey: finalDistrict,
         moves,
         name,
+        avatar,
         joined: true,
         updatedAt: new Date(),
       });
@@ -2932,6 +2940,7 @@ async function friendRows(leagueId, week, uid) {
       name: typeof data.name === 'string' && data.name.trim()
         ? data.name
         : 'MacroSnap user',
+      avatar: lb.publicAvatar(data.avatar),
       points: Number(data.points) || 0,
     };
   });
@@ -3014,19 +3023,29 @@ const PLAY_STORE_URL =
 // upload key and Play's signing key can both be trusted during a rollout. The
 // variable is configuration, not code: the certificate is public, so no
 // secret material lives here.
+// The certificate that signs the APKs published with each release. Its digest is
+// public — it ships inside every APK — so it belongs in the repo rather than in
+// configuration nobody remembers to set. This file used to answer `[]` whenever
+// ASSETLINKS_SHA256 was unset, which is a valid App Links response that verifies
+// NOTHING: Android therefore sent every /join link to the browser, and the
+// browser (identifying as Android) was redirected to the Play Store.
+//
+// Play-installed builds are signed by Google's app-signing key instead, so that
+// digest still has to be added through ASSETLINKS_SHA256 (Play Console → App
+// integrity → App signing key certificate). Both keys are trusted at once, which
+// is what a rollout needs anyway.
+const KNOWN_SIGNING_SHA256 = [
+  '24:0F:92:80:E7:47:23:71:93:AF:36:7B:54:90:15:F8:DC:EB:B2:78:1A:30:8D:2F:CD:56:36:04:B7:9F:84:4F',
+];
+
 app.get('/.well-known/assetlinks.json', (req, res) => {
-  const fingerprints = String(process.env.ASSETLINKS_SHA256 || '')
+  const fromEnv = String(process.env.ASSETLINKS_SHA256 || '')
     .split(/[,\s]+/)
     .map((v) => v.trim().toUpperCase())
     .filter((v) => /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(v));
+  const fingerprints = [...new Set([...fromEnv, ...KNOWN_SIGNING_SHA256])];
   res.set('Cache-Control', 'public, max-age=300');
   res.type('application/json');
-  if (!fingerprints.length) {
-    console.warn(
-      '[applinks] ASSETLINKS_SHA256 is not set — /join links will open in the browser'
-    );
-    return res.json([]);
-  }
   return res.json([
     {
       relation: ['delegate_permission/common.handle_all_urls'],
@@ -3069,20 +3088,71 @@ ${codeLine}
 </main></body></html>`;
 }
 
+// Android visitors need the app, not the store. This page asks Android to start
+// MacroSnap through an `intent://` URL that names the package, which starts the
+// app WITHOUT Digital Asset Links verification — the case that matters while a
+// build is signed by a key assetlinks.json does not list. With no app installed
+// Chrome follows `browser_fallback_url` to the store, still carrying the invite
+// as the install referrer, so nothing is lost.
+//
+// This used to be a bare 302 to the Play Store, which is what made a tapped
+// invite "open in the browser, then jump to Play" even for someone who already
+// had the app installed.
+function androidJoinPage(code, storeUrl) {
+  const intentUrl =
+    `intent://join/${code}#Intent;scheme=macrosnap;` +
+    `package=com.macrosnap.macro_snap;` +
+    `S.browser_fallback_url=${encodeURIComponent(storeUrl)};end`;
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Join a MacroSnap league</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#0B0B0F;color:#fff;font-family:-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:380px;padding:32px 24px;text-align:center}
+h1{font-size:20px;margin:0 0 8px}
+p{font-size:14px;line-height:1.5;color:#B9B4C7;margin:0 0 18px}
+.code{font-size:34px;letter-spacing:8px;font-weight:800;color:#FF6B2B;margin:18px 0}
+.btn{display:block;box-sizing:border-box;background:#FF6B2B;color:#0B0B0F;border:0;
+border-radius:12px;padding:14px 22px;font-size:15px;font-weight:700;text-align:center;
+text-decoration:none}
+.btn.alt{background:transparent;color:#B9B4C7;border:1px solid #2A2A2A;margin-top:10px}
+</style></head><body><main>
+<h1>You have a MacroSnap league invite</h1>
+<p class="code">${code}</p>
+<p id="hint">Opening MacroSnap…</p>
+<a class="btn" href="${intentUrl}">Open MacroSnap</a>
+<a class="btn alt" href="${storeUrl}">Get it on Google Play</a>
+<script>
+// One automatic attempt, then the buttons stay for anyone Chrome would not
+// launch into the app (a blocked intent, or no app installed).
+setTimeout(function(){ window.location.href = '${intentUrl}'; }, 60);
+setTimeout(function(){
+  var hint = document.getElementById('hint');
+  if (hint) hint.textContent = 'Tap to open MacroSnap, or install it below.';
+}, 1500);
+</script>
+</main></body></html>`;
+}
+
 app.get('/join/:code', (req, res) => {
   const raw = String(req.params.code || '').trim();
   const code = /^[A-Za-z0-9]{6}$/.test(raw) ? raw.toUpperCase() : null;
   res.set('Cache-Control', 'no-store');
-  // Android is the only platform that can install straight from here, and the
-  // only one that can hand the code to the app through the install referrer.
-  if (!/android/i.test(String(req.headers['user-agent'] || ''))) {
-    res.type('html').send(joinLandingPage(code));
+  // A link without a usable code cannot open anything: show the page that
+  // explains that, on every platform.
+  if (!code) {
+    res.type('html').send(joinLandingPage(null));
     return;
   }
-  const target = code
-    ? `${PLAY_STORE_URL}&referrer=${encodeURIComponent(`join_code=${code}`)}`
-    : PLAY_STORE_URL;
-  return res.redirect(302, target);
+  // The store link carries the invite as the install referrer, so an install
+  // from here still joins the league on first launch.
+  const storeUrl = `${PLAY_STORE_URL}&referrer=${encodeURIComponent(`join_code=${code}`)}`;
+  const isAndroid = /android/i.test(String(req.headers['user-agent'] || ''));
+  res.type('html').send(
+    isAndroid ? androidJoinPage(code, storeUrl) : joinLandingPage(code)
+  );
 });
 
 // Invite-funnel counters. One document per event, so the owner can count
@@ -3166,6 +3236,7 @@ app.post('/friends/league', requireAuth, rateLimit('/friends/league'), async (re
     const displayName = lb.publicName(
       typeof body.displayName === 'string' ? body.displayName : ''
     );
+    const ownerAvatar = lb.publicAvatar(body.avatar);
 
     await firestore.set(FRIEND_LEAGUE + '/' + leagueId, league);
     await firestore.set(FRIEND_CODES + '/' + code, {
@@ -3175,13 +3246,21 @@ app.post('/friends/league', requireAuth, rateLimit('/friends/league'), async (re
     await firestore.set(FRIEND_LEAGUE + '/' + leagueId + '/members/' + uid, {
       uid,
       name: displayName,
+      avatar: ownerAvatar,
       joinedAt: new Date(),
     });
     // A zero row now, so the owner sees themselves on the board before the
     // first score sync rather than an "empty" league.
     await firestore.set(
       FRIEND_LEAGUE + '/' + leagueId + '/weeks/' + week + '/entries/' + uid,
-      { uid, name: displayName, points: 0, week, updatedAt: new Date() }
+      {
+        uid,
+        name: displayName,
+        avatar: ownerAvatar,
+        points: 0,
+        week,
+        updatedAt: new Date(),
+      }
     );
     await saveFriendIndexIds(uid, [...ids, leagueId]);
 
@@ -3285,9 +3364,11 @@ app.post('/friends/join', requireAuth, rateLimit('/friends/join'), async (req, r
     const joinerName = lb.publicName(
       typeof body.displayName === 'string' ? body.displayName : ''
     );
+    const joinerAvatar = lb.publicAvatar(body.avatar);
     await firestore.set(FRIEND_LEAGUE + '/' + leagueId + '/members/' + uid, {
       uid,
       name: joinerName,
+      avatar: joinerAvatar,
       joinedAt: new Date(),
       // How this member arrived: what the inviter's "joined with your invite"
       // line is built from.
@@ -3297,7 +3378,14 @@ app.post('/friends/join', requireAuth, rateLimit('/friends/join'), async (req, r
     // A zero row now, so a new member appears on the board immediately.
     await firestore.set(
       FRIEND_LEAGUE + '/' + leagueId + '/weeks/' + week + '/entries/' + uid,
-      { uid, name: joinerName, points: 0, week, updatedAt: new Date() }
+      {
+        uid,
+        name: joinerName,
+        avatar: joinerAvatar,
+        points: 0,
+        week,
+        updatedAt: new Date(),
+      }
     );
     await firestore.set(
       FRIEND_LEAGUE + '/' + leagueId,
@@ -3373,6 +3461,7 @@ app.post('/friends/sync', requireAuth, rateLimit('/friends/sync'), async (req, r
     const name = lb.publicName(
       typeof body.name === 'string' ? body.name : ''
     );
+    const avatar = lb.publicAvatar(body.avatar);
 
     const leagues = [];
     const alive = [];
@@ -3383,13 +3472,14 @@ app.post('/friends/sync', requireAuth, rateLimit('/friends/sync'), async (req, r
       const member = await firestore.get(memberPath);
       if (!member) continue; // removed from the group: never write a row back
       alive.push(leagueId);
-      await firestore.set(memberPath, { name }, { merge: true });
+      await firestore.set(memberPath, { name, avatar }, { merge: true });
       await firestore.set(
         FRIEND_LEAGUE + '/' + leagueId + '/weeks/' + week.week +
           '/entries/' + uid,
         {
           uid,
           name,
+          avatar,
           points: scored.weekPoints,
           week: week.week,
           updatedAt: new Date(),
@@ -3406,6 +3496,106 @@ app.post('/friends/sync', requireAuth, rateLimit('/friends/sync'), async (req, r
       dayPoints: scored.dayPoints,
       leagues,
     });
+  } catch (e) {
+    return sendFailure(req, res, e);
+  }
+});
+
+// A profile edit is not a scoring round.
+//
+// Changing the picture used to call /leaderboard/sync AND /friends/sync — two
+// full passes that re-read a week of meals, habits, water and weigh-ins to
+// recompute points a new picture cannot move, and that wrote board rows for an
+// account which had never joined. This route writes ONLY the avatar, and only
+// onto rows that ALREADY EXIST: an account with no board and no league costs a
+// single document read and writes nothing at all.
+app.post('/profile/avatar', requireAuth, rateLimit('/profile/avatar'), async (req, res) => {
+  try {
+    const uid = identityOf(req).uid;
+    if (!uid) return res.status(400).json({ error: 'identity_required' });
+    if (!firestore.isEnabled()) {
+      return res.status(503).json({ error: 'profile_unavailable' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    // The same sanitiser as the sync: these rows are drawn on other people's
+    // phones, so only a shipped illustration may be published.
+    const avatar = lb.publicAvatar(body.avatar);
+    const db = firestore.getDb();
+    const week = lb.isoWeek().week;
+
+    const batch = db.batch();
+    let writes = 0;
+    let boards = 0;
+    let leagues = 0;
+
+    // ── Public board: this week's rows, where the account already has one ──
+    const meta = await firestore.get(LEADERBOARD_META + '/' + uid);
+    const stateKey = meta ? lb.stateKey(meta.stateKey) : null;
+    const districtKey = meta ? lb.slug(meta.districtKey || '') : '';
+    // Same week AND joined: an older week's row is not this profile's board,
+    // and an account that never joined has no row to touch.
+    if (
+      meta &&
+      meta.joined === true &&
+      meta.week === week &&
+      stateKey &&
+      districtKey
+    ) {
+      for (const scope of lb.boardsFor(stateKey, districtKey)) {
+        const ref = db
+          .collection('leaderboard')
+          .doc(week)
+          .collection('scopes')
+          .doc(scope)
+          .collection('entries')
+          .doc(uid);
+        const snap = await ref.get();
+        // Never create a row from a profile edit: that would be joining a
+        // board through the avatar picker.
+        if (!snap.exists) continue;
+        batch.set(ref, { avatar, updatedAt: new Date() }, { merge: true });
+        writes += 1;
+        boards += 1;
+      }
+    }
+
+    // ── Private leagues: membership and this week's league row ─────────────
+    for (const leagueId of await friendIndexIds(uid)) {
+      const members = db
+        .collection(FRIEND_LEAGUE)
+        .doc(leagueId)
+        .collection('members');
+      const memberSnap = await members.doc(uid).get();
+      if (memberSnap.exists) {
+        batch.set(members.doc(uid), { avatar }, { merge: true });
+        writes += 1;
+        leagues += 1;
+      }
+      const rowRef = db
+        .collection(FRIEND_LEAGUE)
+        .doc(leagueId)
+        .collection('weeks')
+        .doc(week)
+        .collection('entries')
+        .doc(uid);
+      const rowSnap = await rowRef.get();
+      if (rowSnap.exists) {
+        batch.set(rowRef, { avatar }, { merge: true });
+        writes += 1;
+      }
+    }
+
+    if (writes) await batch.commit();
+    // Keep the meta copy in step even when there is no row yet, so the next
+    // scoring sync does not write a stale picture back over this one.
+    if (meta && meta.joined === true) {
+      await firestore.set(
+        LEADERBOARD_META + '/' + uid,
+        { avatar },
+        { merge: true }
+      );
+    }
+    return res.json({ ok: true, boards, leagues });
   } catch (e) {
     return sendFailure(req, res, e);
   }

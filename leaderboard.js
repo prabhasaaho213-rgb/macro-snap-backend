@@ -253,6 +253,20 @@ function publicName(value) {
   return clean.length > MAX_NAME_LENGTH ? clean.slice(0, MAX_NAME_LENGTH) : clean;
 }
 
+// ─── Avatars ─────────────────────────────────────────────────────────────
+// The only avatar a board row carries is the illustrated id the app ships
+// (`art:hood`). Anything else — a stray emoji, a URL, a novel string from a
+// modified client — is dropped rather than stored: these strings are rendered
+// on other people's phones, and a board row must not become a place to put
+// arbitrary text.
+const AVATAR_ID = /^art:[a-z][a-z-]{0,23}$/;
+
+function publicAvatar(value) {
+  if (typeof value !== 'string') return '';
+  const clean = value.trim();
+  return AVATAR_ID.test(clean) ? clean : '';
+}
+
 // A stable 4-character tag for an account, so two people called the same thing
 // are still distinguishable and neither can be mistaken for the other.
 function shortTag(uid) {
@@ -455,6 +469,7 @@ module.exports = {
   stepCeiling,
   dietTargetCalories,
   publicName,
+  publicAvatar,
   nameKey,
   shortTag,
   uniqueName,
