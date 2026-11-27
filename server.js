@@ -1554,6 +1554,23 @@ Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
   }
 });
 
+// The identifier an account has PROVED it owns, or null.
+//
+// `identifier` is the email/phone the legacy tables and userIndex are keyed by,
+// and any signed-in token can carry any email string it likes — an
+// email/password account can sit on an address it never verified. Indexing that
+// address lets it claim a `userIndex/{email}` document, and resolveUid() would
+// then hand the REAL owner's later sign-in the impostor's uid: their restored
+// nickname, and every identifier-keyed subscription lookup, would point at the
+// attacker's document. A phone number arrives verified by SMS, so it is always
+// trustworthy; an email must carry email_verified.
+function trustedIdentifier(id) {
+  if (!id) return null;
+  if (id.phone) return id.phone;
+  if (id.email && id.emailVerified === true) return id.email;
+  return null;
+}
+
 app.post('/register', requireAuth, async (req, res) => {
   try {
     // The name is user data the client may choose; the IDENTITY is not — it
@@ -1592,7 +1609,11 @@ app.post('/register', requireAuth, async (req, res) => {
           email: email || null,
           name: safeName,
         }, { merge: true });
-        await firestore.set('userIndex/' + identifier, { uid: fUid, name: safeName }, { merge: true });
+        // Only an identifier the account has proved it owns may be indexed —
+        // see trustedIdentifier().
+        if (trustedIdentifier(id) === identifier) {
+          await firestore.set('userIndex/' + identifier, { uid: fUid, name: safeName }, { merge: true });
+        }
       }
     }
     res.json({ phone: row.phone || identifier, subscribed: row.subscribed || false });
@@ -1607,14 +1628,18 @@ app.post('/register', requireAuth, async (req, res) => {
 app.get('/user/profile', requireAuth, async (req, res) => {
   try {
     // Query params are ignored: the profile returned is always the caller's.
-    const identifier = identityOf(req).identifier;
+    const id = identityOf(req);
+    const identifier = id.identifier;
     if (!identifier) return res.status(400).json({ error: 'Identity required' });
+    // An unverified email must not read the index entry either: that document
+    // may belong to the address's real owner.
+    const indexable = trustedIdentifier(id) === identifier;
     // Firestore first (the DB-less deployment's source of truth): the
     // /register mirror writes userIndex/{identifier}.name so a nickname is
     // never lost after reinstall. Falls back to Postgres when absent.
     let name = null;
     try {
-      const fUid = await firestore.resolveUid(identifier);
+      const fUid = indexable ? await firestore.resolveUid(identifier) : null;
       if (fUid && firestore.isEnabled()) {
         const idx = await firestore.getDb().collection('userIndex').doc(identifier).get();
         if (idx.exists && typeof idx.data().name === 'string') {
@@ -1662,11 +1687,15 @@ app.post('/user/profile', requireAuth, rateLimit('/user/profile'), async (req, r
 
     const fUid = await firestore.resolveUid(identifier);
     if (fUid && firestore.isEnabled()) {
-      await firestore.set(
-        'userIndex/' + identifier,
-        { uid: fUid, name: safeName },
-        { merge: true }
-      );
+      // Same rule as /register: only an identifier the account proved it owns
+      // may be written into the shared index.
+      if (trustedIdentifier(id) === identifier) {
+        await firestore.set(
+          'userIndex/' + identifier,
+          { uid: fUid, name: safeName },
+          { merge: true }
+        );
+      }
       await firestore.set('users/' + fUid, { name: safeName }, { merge: true });
       // A member's leaderboard row carries its own copy of the name. Update it
       // in place, but never create meta for an account that never joined.

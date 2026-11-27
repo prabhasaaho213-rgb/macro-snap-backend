@@ -992,3 +992,39 @@ test('register: the stored name is bounded', async () => {
   assert.ok(idx, 'the index doc must be written');
   assert.equal(idx.data.name.length, 40);
 });
+
+// userIndex is keyed by the email/phone identifier and resolveUid() trusts it.
+// An email/password account can sit on an address it never verified, so writing
+// that address into the index would let it claim the real owner's entry — and
+// the owner's next sign-in would restore the impostor's nickname.
+test('register: an unverified email never claims a userIndex entry', async () => {
+  uidMap['unverified@example.com'] = 'uid_mallory';
+  const req = makeReq({ email: 'unverified@example.com', name: 'Mallory' });
+  req.user = {
+    uid: 'uid_mallory',
+    email: 'unverified@example.com',
+    email_verified: false,
+  };
+  const res = makeRes();
+  await register(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.ok(
+    !fsSets.some((s) => s.path === 'userIndex/unverified@example.com'),
+    'an unverified address must not be indexed'
+  );
+  assert.ok(
+    fsSets.some((s) => s.path === 'users/uid_mallory'),
+    'the account profile is still mirrored under its own uid'
+  );
+});
+
+test('register: a verified email is still indexed', async () => {
+  uidMap['verified@example.com'] = 'uid_verified';
+  const res = makeRes();
+  await register(makeReq({ email: 'verified@example.com', name: 'Asha' }), res);
+  assert.ok(
+    fsSets.some((s) => s.path === 'userIndex/verified@example.com'),
+    'Google sign-in always arrives verified and must keep working'
+  );
+});

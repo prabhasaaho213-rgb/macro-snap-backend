@@ -154,6 +154,9 @@ Module._load = function (request) {
           identifier: 'a@example.com',
           phone: null,
           email: 'a@example.com',
+          // Google sign-in always carries a verified address; identityOf()
+          // only trusts an email that says so (see trustedIdentifier).
+          emailVerified: true,
           isAdmin: false,
         }),
       };
