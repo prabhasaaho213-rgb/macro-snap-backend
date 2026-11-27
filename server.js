@@ -11,6 +11,24 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 
 const app = express();
+
+// ─── Security headers ─────────────────────────────────────────────────
+// A conservative baseline on every response. None of these governs CORS (the
+// origin allowlist below does that) and none can break a JSON client: the
+// native app ignores headers entirely, and a browser only refuses to sniff a
+// content type, to frame the API, or to follow a Referer off-site. HSTS is
+// safe because the deployment is HTTPS-only; browsers ignore it on http.
+app.use((req, res, next) => {
+  // Never advertise the framework or its version to a scanner.
+  if (typeof res.removeHeader === 'function') res.removeHeader('X-Powered-By');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
 // Uploads are buffered in MEMORY, so an unbounded body is an unbounded RAM
 // allocation per request — one oversized file could take the process down.
 // Cap it well above anything the app actually sends (the client compresses to
